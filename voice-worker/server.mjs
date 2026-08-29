@@ -20,7 +20,7 @@ const scenarios = {
 async function loadContext(contextId, fallbackScenario) {
   const base = {
     name: "Maya",
-    voice: "marin",
+    voice: "coral",
     scenario: fallbackScenario in scenarios ? fallbackScenario : "receptionist",
     instructions: "Be warm, natural, multilingual, and never invent business facts.",
     knowledge: process.env.RECEPTIONIST_KNOWLEDGE || "No approved business knowledge is available. Collect a message instead of guessing."
@@ -92,6 +92,10 @@ twilioServer.on("connection", twilio => {
           instructions: `You are ${config.name}, a natural human-sounding HalaCX receptionist. ${config.instructions} ${scenarios[config.scenario]}
 
 Conversation rules:
+- Sound like a real person on a phone call: relaxed, warm, present, and conversational.
+- Use natural contractions, varied intonation, and brief pauses where a person would breathe or think.
+- Avoid a polished announcer cadence, flat rhythm, exaggerated cheerfulness, and scripted customer-service delivery.
+- Let acknowledgements sound spontaneous and understated. Do not use the exact same acknowledgement repeatedly.
 - Keep most replies to one short sentence. Use two only when necessary.
 - Do not repeat, paraphrase, or summarize what the caller just said.
 - When taking notes, capture details silently. Say only a brief acknowledgement such as "Got it" and ask the next necessary question.
@@ -113,7 +117,7 @@ Approved business knowledge: ${config.knowledge}`,
       for (const audio of bufferedAudio.splice(0)) sendOpenAI({ type: "input_audio_buffer.append", audio });
       if (!greetingSent) {
         greetingSent = true;
-        sendOpenAI({ type: "response.create", response: { instructions: `Say only: "Hi, this is ${config.name}. How can I help?" Use the caller's language if they speak first.` } });
+        sendOpenAI({ type: "response.create", response: { instructions: `Give a brief, warm greeting in a relaxed conversational tone: "Hi, ${config.name} here — how can I help?" Do not sound like an announcement. Use the caller's language if they speak first.` } });
       }
       console.log("openai_connected", { streamSid });
     });
