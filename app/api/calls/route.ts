@@ -9,6 +9,7 @@ const schema = z.object({
     .transform((value) => value.replace(/[\s()-]/g, ""))
     .refine((value) => /^(?:\+971\d{8,9}|\+91\d{10})$/.test(value)),
   context: z.enum(["receptionist", "appointment", "lead", "support"]).default("receptionist"),
+  voiceProvider: z.enum(["openai", "sarvam", "cartesia"]).default("sarvam"),
 });
 
 export async function POST(request: Request) {
@@ -37,7 +38,7 @@ export async function POST(request: Request) {
 
   const pending = await createPendingCallContext(parsed.data.context, session && !session.preview ? session.workspaceId : undefined);
   const contextParameter = pending.id ? `<Parameter name="contextId" value="${pending.id}"/>` : "";
-  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}<Parameter name="scenario" value="${pending.context}"/></Stream></Connect></Response>`;
+  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}<Parameter name="scenario" value="${pending.context}"/><Parameter name="voiceProvider" value="${parsed.data.voiceProvider}"/></Stream></Connect></Response>`;
   const body = new URLSearchParams({
     To: parsed.data.phone,
     From: from,

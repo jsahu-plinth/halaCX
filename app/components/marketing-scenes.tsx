@@ -16,6 +16,12 @@ const phoneCountries = [
   { code: "+91", label: "India +91" },
 ];
 
+const voiceProviders = [
+  { key: "openai", name: "OpenAI", voice: "Coral", detail: "Native speech-to-speech · fastest" },
+  { key: "sarvam", name: "Sarvam", voice: "Priya", detail: "Natural Indian English" },
+  { key: "cartesia", name: "Cartesia", voice: "Skylar", detail: "Expressive global voice" },
+] as const;
+
 const voiceLevels = Array.from({ length: 120 }, (_, index) => {
   const phrases = [[0, 18, .72], [22, 43, .96], [49, 64, .58], [70, 94, .88], [100, 119, .68]];
   const phrase = phrases.find(([start, end]) => index >= start && index <= end);
@@ -31,6 +37,7 @@ export default function MarketingScenes() {
   const [activeStep, setActiveStep] = useState(0);
   const [context, setContext] = useState(contexts[0]);
   const [phone, setPhone] = useState("+971");
+  const [voiceProvider, setVoiceProvider] = useState<(typeof voiceProviders)[number]["key"]>("sarvam");
   const [callState, setCallState] = useState<"idle"|"loading"|"success"|"error">("idle");
   const [message, setMessage] = useState("");
   const actionRef = useRef<HTMLElement | null>(null);
@@ -79,7 +86,7 @@ export default function MarketingScenes() {
   async function requestCall(event: React.FormEvent) {
     event.preventDefault(); setCallState("loading"); setMessage("");
     try {
-      const response = await fetch("/api/calls", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ phone, context: context.key }) });
+      const response = await fetch("/api/calls", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ phone, context: context.key, voiceProvider }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "The call could not be started.");
       setCallState("success"); setMessage(result.demo ? "Preview started. Connect voice credentials for a real call." : "Call started. Pick up when your phone rings.");
@@ -132,7 +139,7 @@ export default function MarketingScenes() {
     </section>
 
     <section className="live-demo-lab" id="live-demo">
-      <div className="demo-form-side"><p>LIVE DEMO</p><h2>Don’t take our word for it.<br/>Take the call.</h2><span>Choose a conversation and enter the number you want us to call.</span><div className="context-tabs" role="tablist">{contexts.map(item=><button key={item.key} className={context.key===item.key?"active":""} onClick={()=>setContext(item)} role="tab" aria-selected={context.key===item.key}>{item.label}</button>)}</div><p className="context-line">{context.line}</p><form onSubmit={requestCall}><label htmlFor="demo-phone">YOUR MOBILE NUMBER</label><div><select aria-label="Country code" value={phone.startsWith("+91")&&!phone.startsWith("+971")?"+91":"+971"} onChange={event=>changePhoneCountry(event.target.value)}>{phoneCountries.map(country=><option key={country.code} value={country.code}>{country.label}</option>)}</select><input id="demo-phone" value={phone} onChange={event=>setPhone(event.target.value)} inputMode="tel" aria-label="Mobile number in international format"/><button disabled={callState==="loading"}><Phone weight="fill"/>{callState==="loading"?"Calling…":"Call me"}</button></div>{message&&<small className={callState}>{message}</small>}</form></div>
+      <div className="demo-form-side"><p>LIVE DEMO</p><h2>Don’t take our word for it.<br/>Take the call.</h2><span>Choose a conversation, choose the voice stack, then enter the number you want us to call.</span><div className="context-tabs" role="tablist">{contexts.map(item=><button type="button" key={item.key} className={context.key===item.key?"active":""} onClick={()=>setContext(item)} role="tab" aria-selected={context.key===item.key}>{item.label}</button>)}</div><p className="context-line">{context.line}</p><div className="provider-picker"><label>CHOOSE THE VOICE</label><div role="radiogroup" aria-label="Voice provider">{voiceProviders.map(provider=><button type="button" key={provider.key} className={voiceProvider===provider.key?"active":""} onClick={()=>setVoiceProvider(provider.key)} role="radio" aria-checked={voiceProvider===provider.key}><span><strong>{provider.name}</strong><em>{provider.voice}</em></span><small>{provider.detail}</small></button>)}</div></div><form onSubmit={requestCall}><label htmlFor="demo-phone">YOUR MOBILE NUMBER</label><div><select aria-label="Country code" value={phone.startsWith("+91")&&!phone.startsWith("+971")?"+91":"+971"} onChange={event=>changePhoneCountry(event.target.value)}>{phoneCountries.map(country=><option key={country.code} value={country.code}>{country.label}</option>)}</select><input id="demo-phone" value={phone} onChange={event=>setPhone(event.target.value)} inputMode="tel" aria-label="Mobile number in international format"/><button disabled={callState==="loading"}><Phone weight="fill"/>{callState==="loading"?"Calling…":"Call me"}</button></div>{message&&<small className={callState}>{message}</small>}</form></div>
       <div className="demo-storyboard"><p>WHAT HAPPENS NEXT</p><ol><li><span>1</span><div><strong>You request a demo</strong><small>Pick a context and enter your number.</small></div></li><li><span>2</span><div><strong>We call you in seconds</strong><small>No app, headset or setup required.</small></div></li><li><span>3</span><div><strong>You talk to HalaCX</strong><small>A real voice agent follows the selected scenario.</small></div></li><li><span>4</span><div><strong>You see the outcome</strong><small>The transcript and call details land in your workspace.</small></div></li></ol></div>
     </section>
 

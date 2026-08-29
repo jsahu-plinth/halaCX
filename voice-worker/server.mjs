@@ -77,6 +77,7 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 twilioServer.on("connection", twilio => {
+  let selectedVoiceProvider = voiceProvider;
   let streamSid = "";
   let openai = null;
   let cartesia = null;
@@ -101,7 +102,7 @@ twilioServer.on("connection", twilio => {
   }
 
   function connectCartesia() {
-    if (voiceProvider !== "cartesia") return;
+    if (selectedVoiceProvider !== "cartesia") return;
     cartesia = new WebSocket("wss://api.cartesia.ai/tts/websocket?cartesia_version=2026-03-01", {
       headers: { Authorization: `Bearer ${cartesiaApiKey}` }
     });
@@ -142,7 +143,7 @@ twilioServer.on("connection", twilio => {
   }
 
   function connectSarvam() {
-    if (voiceProvider !== "sarvam") return;
+    if (selectedVoiceProvider !== "sarvam") return;
     const generation = ++sarvamGeneration;
     sarvam = new WebSocket("wss://api.sarvam.ai/text-to-speech/ws?model=bulbul%3Av3&send_completion_event=true", {
       headers: { "Api-Subscription-Key": sarvamApiKey }
@@ -198,7 +199,7 @@ twilioServer.on("connection", twilio => {
   function interruptExternalVoice() {
     if (cartesiaContextId) sendCartesia({ context_id: cartesiaContextId, cancel: true });
     cartesiaContextId = "";
-    if (voiceProvider === "sarvam" && sarvam) {
+    if (selectedVoiceProvider === "sarvam" && sarvam) {
       sarvamGeneration += 1;
       sarvam.close(1000, "Caller interrupted");
       sarvam = null;
@@ -236,10 +237,10 @@ Conversation rules:
 - Match the caller's language and level of formality.
 
 Approved business knowledge: ${config.knowledge}`,
-          output_modalities: [voiceProvider === "openai" ? "audio" : "text"],
+          output_modalities: [selectedVoiceProvider === "openai" ? "audio" : "text"],
           audio: {
             input: { format: { type: "audio/pcmu" }, turn_detection: { type: "server_vad", create_response: true, interrupt_response: true } },
-            ...(voiceProvider === "openai" ? { output: { format: { type: "audio/pcmu" }, voice: config.voice || "coral" } } : {})
+            ...(selectedVoiceProvider === "openai" ? { output: { format: { type: "audio/pcmu" }, voice: config.voice || "coral" } } : {})
           }
         }
       });
@@ -256,16 +257,16 @@ Approved business knowledge: ${config.knowledge}`,
       if ((event.type === "response.output_audio.delta" || event.type === "response.audio.delta") && event.delta && twilio.readyState === WebSocket.OPEN) {
         twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.delta } }));
       }
-      if (voiceProvider === "cartesia" && (event.type === "response.output_text.delta" || event.type === "response.text.delta") && event.delta) {
+      if (selectedVoiceProvider === "cartesia" && (event.type === "response.output_text.delta" || event.type === "response.text.delta") && event.delta) {
         streamTextToCartesia(event.delta);
       }
-      if (voiceProvider === "cartesia" && (event.type === "response.output_text.done" || event.type === "response.text.done")) {
+      if (selectedVoiceProvider === "cartesia" && (event.type === "response.output_text.done" || event.type === "response.text.done")) {
         streamTextToCartesia("", true);
       }
-      if (voiceProvider === "sarvam" && (event.type === "response.output_text.delta" || event.type === "response.text.delta") && event.delta) {
+      if (selectedVoiceProvider === "sarvam" && (event.type === "response.output_text.delta" || event.type === "response.text.delta") && event.delta) {
         streamTextToSarvam(event.delta);
       }
-      if (voiceProvider === "sarvam" && (event.type === "response.output_text.done" || event.type === "response.text.done")) {
+      if (selectedVoiceProvider === "sarvam" && (event.type === "response.output_text.done" || event.type === "response.text.done")) {
         streamTextToSarvam("", true);
       }
       if (event.type === "input_audio_buffer.speech_started" && twilio.readyState === WebSocket.OPEN) {
@@ -282,6 +283,8 @@ Approved business knowledge: ${config.knowledge}`,
     const event = JSON.parse(raw.toString());
     if (event.event === "start") {
       streamSid = event.start.streamSid;
+      const requestedProvider = event.start.customParameters?.voiceProvider;
+      if (["openai", "sarvam", "cartesia"].includes(requestedProvider)) selectedVoiceProvider = requestedProvider;
       connectCartesia();
       connectSarvam();
       connectOpenAI(event.start.customParameters || {}).catch(error => console.error("openai_connect_failed", error.message));
