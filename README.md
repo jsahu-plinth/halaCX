@@ -1,5 +1,13 @@
 # HalaCX
 
+## Agentic connectors
+
+HalaCX uses the MIT-licensed Composio SDK as its connector gateway. Each customer workspace maps to a separate external user identity, so OAuth connections and tool access do not cross tenants. Notion, Google Drive, Google Calendar, Gmail, and Google Sheets are available in the dashboard.
+
+The live voice worker exposes the same two-function contract to every supported model: search for an appropriate connected tool, then execute that tool. Current connector sessions are filtered to Composio's `readOnlyHint` tools. Write actions are intentionally disabled until a confirmation and audit policy is added.
+
+Set `COMPOSIO_API_KEY` in both the web deployment and the Railway voice worker, run `npm run db:migrate`, then connect apps from the dashboard.
+
 A multilingual AI call-center platform built with Next.js, PostgreSQL/Supabase, Twilio Voice, and OpenAI Realtime. HalaCX includes account authentication, workspace and agent configuration, a knowledge base, outbound demo calls, signed provider webhooks, and a call dashboard with recordings, transcripts, summaries, and outcomes.
 
 ## Run the interface

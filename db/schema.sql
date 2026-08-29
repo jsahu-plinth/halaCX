@@ -98,8 +98,23 @@ create table if not exists demo_requests (
   created_at timestamptz not null default now()
 );
 
+create table if not exists workspace_connectors (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  toolkit_slug text not null,
+  display_name text not null,
+  status text not null default 'pending',
+  access_level text not null default 'read',
+  connected_account_id text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (workspace_id, toolkit_slug),
+  check (access_level in ('read', 'write'))
+);
+
 create index if not exists calls_workspace_created_idx on calls(workspace_id, created_at desc);
 create index if not exists knowledge_workspace_idx on knowledge_sources(workspace_id);
 create index if not exists pending_context_expiry_idx on pending_call_contexts(expires_at, created_at desc);
 create index if not exists call_events_call_idx on call_events(call_id, created_at);
 create index if not exists demo_requests_client_idx on demo_requests(client_hash, created_at desc);
+create index if not exists workspace_connectors_workspace_idx on workspace_connectors(workspace_id, updated_at desc);

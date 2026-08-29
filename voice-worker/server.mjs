@@ -2,6 +2,7 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import WebSocket, { WebSocketServer } from "ws";
+import { Composio } from "@composio/core";
 
 const { Pool } = pg;
 const port = Number(process.env.PORT || 8080);
@@ -15,6 +16,8 @@ const sarvamLanguage = process.env.SARVAM_LANGUAGE || "hi-IN";
 const sarvamSttModel = process.env.SARVAM_STT_MODEL || "saaras:v3";
 const sarvamChatModel = process.env.SARVAM_CHAT_MODEL || "sarvam-105b-conversations";
 const databaseUrl = process.env.DATABASE_URL;
+const composioApiKey = process.env.COMPOSIO_API_KEY;
+const composio = composioApiKey ? new Composio({ apiKey: composioApiKey }) : null;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, ssl: { rejectUnauthorized: false } }) : null;
 
 if (!apiKey) throw new Error("OPENAI_API_KEY is required");
@@ -49,7 +52,9 @@ async function loadContext(contextId, fallbackScenario) {
     voice: "coral",
     scenario: fallbackScenario in scenarios ? fallbackScenario : "receptionist",
     instructions: "Be warm, natural, multilingual, and never invent business facts.",
-    knowledge: process.env.RECEPTIONIST_KNOWLEDGE || "No approved business knowledge is available. Collect a message instead of guessing."
+    knowledge: process.env.RECEPTIONIST_KNOWLEDGE || "No approved business knowledge is available. Collect a message instead of guessing.",
+    workspaceId: "",
+    connectorToolkits: []
   };
   if (!pool || !contextId) return base;
   const client = await pool.connect();
@@ -58,16 +63,19 @@ async function loadContext(contextId, fallbackScenario) {
     const pending = await client.query("delete from pending_call_contexts where id=$1 and expires_at>now() returning workspace_id,context,provider_call_id", [contextId]);
     const row = pending.rows[0];
     if (!row?.workspace_id) { await client.query("commit"); return { ...base, scenario: row?.context || base.scenario }; }
-    const [agent, knowledge] = await Promise.all([
+    const [agent, knowledge, connectors] = await Promise.all([
       client.query("select name,voice,instructions from agents where workspace_id=$1 order by created_at limit 1", [row.workspace_id]),
-      client.query("select content from knowledge_sources where workspace_id=$1 and status='active' order by updated_at desc limit 30", [row.workspace_id])
+      client.query("select content from knowledge_sources where workspace_id=$1 and status='active' order by updated_at desc limit 30", [row.workspace_id]),
+      client.query("select toolkit_slug from workspace_connectors where workspace_id=$1 and status='connected' and access_level='read' order by toolkit_slug", [row.workspace_id])
     ]);
     await client.query("commit");
     return {
       ...base,
       ...agent.rows[0],
+      workspaceId: row.workspace_id,
       scenario: row.context || base.scenario,
-      knowledge: knowledge.rows.length ? knowledge.rows.map(item => item.content).join("\n\n").slice(0, 40000) : base.knowledge
+      knowledge: knowledge.rows.length ? knowledge.rows.map(item => item.content).join("\n\n").slice(0, 40000) : base.knowledge,
+      connectorToolkits: connectors.rows.map(item => item.toolkit_slug)
     };
   } catch (error) {
     await client.query("rollback");
@@ -112,6 +120,7 @@ twilioServer.on("connection", twilio => {
   let sarvamReplyController = null;
   let sarvamMessages = [];
   let sarvamSystemPrompt = "";
+  let connectorSession = null;
 
   function sendOpenAI(payload) {
     if (openai?.readyState === WebSocket.OPEN) openai.send(JSON.stringify(payload));
@@ -234,6 +243,30 @@ twilioServer.on("connection", twilio => {
     }
   }
 
+  async function setupConnectorSession(config) {
+    if (!composio || !config.workspaceId || !config.connectorToolkits.length) return;
+    try {
+      connectorSession = await composio.sessions.create(`halacx_workspace_${config.workspaceId}`, {
+        toolkits: { enable: config.connectorToolkits },
+        tags: { enable: ["readOnlyHint"] },
+        manageConnections: false
+      });
+      console.log("connector_session_ready", { streamSid, toolkits: config.connectorToolkits });
+    } catch (error) {
+      connectorSession = null;
+      console.error("connector_session_failed", error.message);
+    }
+  }
+
+  async function executeConnectorFunction(name, rawArguments) {
+    if (!connectorSession) return { error: "No connected tools are available" };
+    let args = {};
+    try { args = JSON.parse(rawArguments || "{}"); } catch { return { error: "Invalid tool arguments" }; }
+    if (name === "search_connected_tools") return connectorSession.search({ query: String(args.query || "") });
+    if (name === "execute_connected_tool") return connectorSession.execute(String(args.tool_slug || ""), args.arguments && typeof args.arguments === "object" ? args.arguments : {});
+    return { error: "Unknown tool" };
+  }
+
   async function generateSarvamReply(userText) {
     const cleanText = userText?.trim();
     if (!cleanText) return;
@@ -243,6 +276,49 @@ twilioServer.on("connection", twilio => {
     sarvamMessages = sarvamMessages.slice(-12);
     let assistantText = "";
     try {
+      if (connectorSession) {
+        const tools = [
+          { type: "function", function: { name: "search_connected_tools", description: "Find the right read-only connected app tool for the caller's request. Call this before executing a connected tool.", parameters: { type: "object", properties: { query: { type: "string", description: "What information needs to be found" } }, required: ["query"] } } },
+          { type: "function", function: { name: "execute_connected_tool", description: "Execute a read-only tool returned by search_connected_tools.", parameters: { type: "object", properties: { tool_slug: { type: "string" }, arguments: { type: "object", additionalProperties: true } }, required: ["tool_slug", "arguments"] } } }
+        ];
+        for (let round = 0; round < 3; round += 1) {
+          const response = await fetch("https://api.sarvam.ai/v1/chat/completions", {
+            method: "POST",
+            headers: { "api-subscription-key": sarvamApiKey, "content-type": "application/json" },
+            body: JSON.stringify({ model: sarvamChatModel, messages: [{ role: "system", content: sarvamSystemPrompt }, ...sarvamMessages], tools, tool_choice: "auto", temperature: 0.25, max_tokens: 180 }),
+            signal: sarvamReplyController.signal
+          });
+          if (!response.ok) throw new Error(`Sarvam agentic chat failed (${response.status}): ${await response.text()}`);
+          const completion = await response.json();
+          const message = completion.choices?.[0]?.message;
+          if (!message) throw new Error("Sarvam returned no message");
+          if (!message.tool_calls?.length) {
+            assistantText = message.content || "I couldn't find that right now. I can take a message for the team.";
+            streamTextToSarvam(assistantText, true);
+            sarvamMessages.push({ role: "assistant", content: assistantText });
+            sarvamMessages = sarvamMessages.slice(-16);
+            return;
+          }
+          sarvamMessages.push(message);
+          for (const call of message.tool_calls) {
+            let args = {};
+            try { args = JSON.parse(call.function?.arguments || "{}"); } catch {}
+            let result;
+            try {
+              if (call.function?.name === "search_connected_tools") result = await connectorSession.search({ query: String(args.query || "") });
+              else if (call.function?.name === "execute_connected_tool") result = await connectorSession.execute(String(args.tool_slug || ""), args.arguments && typeof args.arguments === "object" ? args.arguments : {});
+              else result = { error: "Unknown tool" };
+            } catch (error) {
+              result = { error: error.message || "Tool failed" };
+            }
+            sarvamMessages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result).slice(0, 16000) });
+          }
+        }
+        assistantText = "I need a little more time to check that. I can have the team follow up.";
+        streamTextToSarvam(assistantText, true);
+        sarvamMessages.push({ role: "assistant", content: assistantText });
+        return;
+      }
       const response = await fetch("https://api.sarvam.ai/v1/chat/completions", {
         method: "POST",
         headers: { "api-subscription-key": sarvamApiKey, "content-type": "application/json" },
@@ -285,6 +361,7 @@ twilioServer.on("connection", twilio => {
 
   async function connectSarvamFullStack(parameters = {}) {
     const config = await loadContext(parameters.contextId, parameters.scenario);
+    await setupConnectorSession(config);
     sarvamSystemPrompt = `You are ${config.name}, a warm, concise HalaCX receptionist. ${config.instructions} ${scenarios[config.scenario]}
 
 Conversation rules:
@@ -296,6 +373,8 @@ Conversation rules:
 - When taking notes, say only a brief acknowledgement and ask the next necessary question.
 - Ask one question at a time. Never explain your process.
 - Never invent business facts. Offer a human follow-up when the knowledge does not answer the caller.
+- When connected tools are available and the caller asks for live business information, quietly search the relevant tool and answer from its result. Do not announce internal tool names or your process.
+- Connected tools are read-only. Never promise that you changed, sent, booked, deleted, or updated anything.
 
 Approved business knowledge: ${config.knowledge}`;
     connectSarvam();
@@ -341,6 +420,7 @@ Approved business knowledge: ${config.knowledge}`;
 
   async function connectOpenAI(parameters = {}) {
     const config = await loadContext(parameters.contextId, parameters.scenario);
+    await setupConnectorSession(config);
     openai = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1", {
       headers: { Authorization: `Bearer ${apiKey}`, origin: "https://api.openai.com" }
     });
@@ -371,7 +451,14 @@ Approved business knowledge: ${config.knowledge}`,
           audio: {
             input: { format: { type: "audio/pcmu" }, turn_detection: { type: "server_vad", create_response: true, interrupt_response: true } },
             ...(selectedVoiceProvider === "openai" ? { output: { format: { type: "audio/pcmu" }, voice: config.voice || "coral" } } : {})
-          }
+          },
+          ...(connectorSession ? {
+            tools: [
+              { type: "function", name: "search_connected_tools", description: "Find a read-only connected app tool for live business information. Use before executing a connected tool.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+              { type: "function", name: "execute_connected_tool", description: "Execute a read-only tool returned by search_connected_tools.", parameters: { type: "object", properties: { tool_slug: { type: "string" }, arguments: { type: "object", additionalProperties: true } }, required: ["tool_slug", "arguments"] } }
+            ],
+            tool_choice: "auto"
+          } : {})
         }
       });
       ready = true;
@@ -402,6 +489,18 @@ Approved business knowledge: ${config.knowledge}`,
       if (event.type === "input_audio_buffer.speech_started" && twilio.readyState === WebSocket.OPEN) {
         twilio.send(JSON.stringify({ event: "clear", streamSid }));
         interruptExternalVoice();
+      }
+      if (event.type === "response.done") {
+        const calls = (event.response?.output || []).filter(item => item.type === "function_call");
+        for (const call of calls) {
+          executeConnectorFunction(call.name, call.arguments).then(result => {
+            sendOpenAI({ type: "conversation.item.create", item: { type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result).slice(0, 16000) } });
+            sendOpenAI({ type: "response.create" });
+          }).catch(error => {
+            sendOpenAI({ type: "conversation.item.create", item: { type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: error.message || "Tool failed" }) } });
+            sendOpenAI({ type: "response.create" });
+          });
+        }
       }
       if (event.type === "error") console.error("openai_error", event.error?.code, event.error?.message);
     });
