@@ -107,6 +107,7 @@ twilioServer.on("connection", twilio => {
   const cartesiaQueue = [];
   const sarvamQueue = [];
   let sarvamGeneration = 0;
+  let sarvamSpeaking = false;
   let sarvamTextBuffer = "";
   let sarvamReplyController = null;
   let sarvamMessages = [];
@@ -189,8 +190,10 @@ twilioServer.on("connection", twilio => {
       if (generation !== sarvamGeneration) return;
       const event = JSON.parse(raw.toString());
       if (event.type === "audio" && event.data?.audio && twilio.readyState === WebSocket.OPEN) {
+        sarvamSpeaking = true;
         twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.data.audio } }));
       }
+      if (["completion", "completed"].includes(event.type)) sarvamSpeaking = false;
       if (event.type === "error") console.error("sarvam_error", event.data?.code, event.data?.message || event);
     });
     sarvam.on("error", error => console.error("sarvam_socket_error", error.message));
@@ -220,10 +223,11 @@ twilioServer.on("connection", twilio => {
   function interruptExternalVoice() {
     if (cartesiaContextId) sendCartesia({ context_id: cartesiaContextId, cancel: true });
     cartesiaContextId = "";
-    if (selectedVoiceProvider === "sarvam" && sarvam) {
+    if (selectedVoiceProvider === "sarvam" && sarvam && sarvamSpeaking) {
       sarvamGeneration += 1;
       sarvam.close(1000, "Caller interrupted");
       sarvam = null;
+      sarvamSpeaking = false;
       sarvamQueue.length = 0;
       sarvamTextBuffer = "";
       connectSarvam();
