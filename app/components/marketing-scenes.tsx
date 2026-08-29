@@ -11,6 +11,11 @@ const contexts = [
   { key: "support", label: "Customer support", line: "Describe an order or service issue and ask for help." },
 ];
 
+const phoneCountries = [
+  { code: "+971", label: "UAE +971" },
+  { code: "+91", label: "India +91" },
+];
+
 const voiceLevels = Array.from({ length: 120 }, (_, index) => {
   const phrases = [[0, 18, .72], [22, 43, .96], [49, 64, .58], [70, 94, .88], [100, 119, .68]];
   const phrase = phrases.find(([start, end]) => index >= start && index <= end);
@@ -81,6 +86,10 @@ export default function MarketingScenes() {
     } catch (error) { setCallState("error"); setMessage(error instanceof Error ? error.message : "The call could not be started."); }
   }
 
+  function changePhoneCountry(code: string) {
+    setPhone((current) => code + current.replace(/^\+(?:971|91)/, ""));
+  }
+
   return <>
     <section className="language-cinema" aria-label="Multilingual conversations">
       <div className="language-heading"><p>ONE CONVERSATION</p><h2>Any language.</h2></div>
@@ -123,7 +132,7 @@ export default function MarketingScenes() {
     </section>
 
     <section className="live-demo-lab" id="live-demo">
-      <div className="demo-form-side"><p>LIVE DEMO</p><h2>Don’t take our word for it.<br/>Take the call.</h2><span>Choose a conversation and enter the number you want us to call.</span><div className="context-tabs" role="tablist">{contexts.map(item=><button key={item.key} className={context.key===item.key?"active":""} onClick={()=>setContext(item)} role="tab" aria-selected={context.key===item.key}>{item.label}</button>)}</div><p className="context-line">{context.line}</p><form onSubmit={requestCall}><label htmlFor="demo-phone">YOUR MOBILE NUMBER</label><div><input id="demo-phone" value={phone} onChange={event=>setPhone(event.target.value)} inputMode="tel" aria-label="Mobile number in international format"/><button disabled={callState==="loading"}><Phone weight="fill"/>{callState==="loading"?"Calling…":"Call me"}</button></div>{message&&<small className={callState}>{message}</small>}</form></div>
+      <div className="demo-form-side"><p>LIVE DEMO</p><h2>Don’t take our word for it.<br/>Take the call.</h2><span>Choose a conversation and enter the number you want us to call.</span><div className="context-tabs" role="tablist">{contexts.map(item=><button key={item.key} className={context.key===item.key?"active":""} onClick={()=>setContext(item)} role="tab" aria-selected={context.key===item.key}>{item.label}</button>)}</div><p className="context-line">{context.line}</p><form onSubmit={requestCall}><label htmlFor="demo-phone">YOUR MOBILE NUMBER</label><div><select aria-label="Country code" value={phone.startsWith("+91")&&!phone.startsWith("+971")?"+91":"+971"} onChange={event=>changePhoneCountry(event.target.value)}>{phoneCountries.map(country=><option key={country.code} value={country.code}>{country.label}</option>)}</select><input id="demo-phone" value={phone} onChange={event=>setPhone(event.target.value)} inputMode="tel" aria-label="Mobile number in international format"/><button disabled={callState==="loading"}><Phone weight="fill"/>{callState==="loading"?"Calling…":"Call me"}</button></div>{message&&<small className={callState}>{message}</small>}</form></div>
       <div className="demo-storyboard"><p>WHAT HAPPENS NEXT</p><ol><li><span>1</span><div><strong>You request a demo</strong><small>Pick a context and enter your number.</small></div></li><li><span>2</span><div><strong>We call you in seconds</strong><small>No app, headset or setup required.</small></div></li><li><span>3</span><div><strong>You talk to HalaCX</strong><small>A real voice agent follows the selected scenario.</small></div></li><li><span>4</span><div><strong>You see the outcome</strong><small>The transcript and call details land in your workspace.</small></div></li></ol></div>
     </section>
 

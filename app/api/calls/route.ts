@@ -5,7 +5,9 @@ import { isDatabaseConfigured, query } from "@/lib/db";
 import { allowDemoCall, attachProviderCall, createPendingCallContext, discardPendingCall } from "@/lib/call-context";
 
 const schema = z.object({
-  phone: z.string().regex(/^\+[1-9]\d{7,14}$/),
+  phone: z.string()
+    .transform((value) => value.replace(/[\s()-]/g, ""))
+    .refine((value) => /^(?:\+971\d{8,9}|\+91\d{10})$/.test(value)),
   context: z.enum(["receptionist", "appointment", "lead", "support"]).default("receptionist"),
 });
 
@@ -13,7 +15,7 @@ export async function POST(request: Request) {
   const session = await readSession();
   const parsed = schema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
-    return NextResponse.json({ error: "Use an international number such as +971501234567." }, { status: 400 });
+    return NextResponse.json({ error: "Enter a valid UAE (+971) or India (+91) mobile number." }, { status: 400 });
   }
   const clientKey = request.headers.get("x-forwarded-for")?.split(",")[0] || "local";
   if (!session && !(await allowDemoCall(clientKey))) return NextResponse.json({ error: "Demo limit reached. Try again in ten minutes." }, { status: 429 });
