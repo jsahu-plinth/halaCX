@@ -15,7 +15,12 @@ export async function POST(request: Request) {
   try {
     const toolkit = connectorCatalog.find(item => item.slug === parsed.data.toolkit)!;
     const origin = process.env.APP_URL || new URL(request.url).origin;
-    const connection = await getComposio().toolkits.authorize(composioUserId(session.workspaceId), toolkit.slug);
+    const composioSession = await getComposio().sessions.create(composioUserId(session.workspaceId), {
+      toolkits: [toolkit.slug],
+      manageConnections: false,
+    });
+    const callbackUrl = `${origin}/dashboard?connect=complete`;
+    const connection = await composioSession.authorize(toolkit.slug, { callbackUrl });
     await query(
       `insert into workspace_connectors(workspace_id,toolkit_slug,display_name,status)
        values($1,$2,$3,'pending')
@@ -24,7 +29,7 @@ export async function POST(request: Request) {
     );
     const redirectUrl = connection.redirectUrl;
     if (!redirectUrl) throw new Error("No authorization URL returned");
-    return NextResponse.json({ redirectUrl, callbackUrl: `${origin}/dashboard?connect=complete` });
+    return NextResponse.json({ redirectUrl, callbackUrl });
   } catch (error) {
     if (error instanceof Error && error.message === "COMPOSIO_NOT_CONFIGURED") {
       return NextResponse.json({ error: "Connector service is not configured yet" }, { status: 503 });
