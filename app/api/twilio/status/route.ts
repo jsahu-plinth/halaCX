@@ -5,6 +5,12 @@ export async function POST(request: Request) {
   const form = await request.formData();
   const data = Object.fromEntries(form);
   if (!validateTwilioWebhook(request, data)) return NextResponse.json({ error: "Invalid Twilio signature" }, { status: 403 });
+  console.info("Twilio call status", {
+    callSid: String(data.CallSid || ""),
+    parentCallSid: String(data.ParentCallSid || ""),
+    callStatus: String(data.CallStatus || ""),
+    sipResponseCode: String(data.SipResponseCode || ""),
+  });
   if (isDatabaseConfigured && data.CallSid) {
     const result = await query<{ id: string }>(
       "update calls set status=$1,duration_seconds=coalesce($2::integer,duration_seconds),ended_at=case when $1 in ('completed','failed','busy','no-answer','canceled') then now() else ended_at end where provider_call_id=$3 returning id",

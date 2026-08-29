@@ -1,8 +1,10 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import OpenAI from "openai";
 import WebSocket from "ws";
 import { consumePendingCallContext, contextInstructions } from "@/lib/call-context";
 import { isDatabaseConfigured, query } from "@/lib/db";
+
+export const maxDuration = 30;
 
 async function startGreeting(callId: string, agentName: string) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -15,7 +17,7 @@ async function startGreeting(callId: string, agentName: string) {
     const timeout = setTimeout(() => {
       socket.terminate();
       reject(new Error("Realtime greeting connection timed out"));
-    }, 5_000);
+    }, 15_000);
 
     socket.once("open", () => {
       socket.send(JSON.stringify({
@@ -24,11 +26,21 @@ async function startGreeting(callId: string, agentName: string) {
           instructions: `Introduce yourself as ${agentName} from HalaCX, welcome the caller warmly, and ask how you can help. Keep the greeting brief and match the caller's language once they respond.`,
         },
       }));
-      setTimeout(() => {
+    });
+    socket.on("message", (raw) => {
+      try {
+        const event = JSON.parse(raw.toString()) as { type?: string; error?: { message?: string } };
+        if (event.type === "error") throw new Error(event.error?.message || "Realtime greeting failed");
+        if (event.type === "response.done") {
+          clearTimeout(timeout);
+          socket.close();
+          resolve();
+        }
+      } catch (error) {
         clearTimeout(timeout);
-        socket.close();
-        resolve();
-      }, 500);
+        socket.terminate();
+        reject(error);
+      }
     });
     socket.once("error", (error) => {
       clearTimeout(timeout);
@@ -84,7 +96,8 @@ export async function POST(request: Request) {
       type: "realtime",
       model: "gpt-realtime-2.1",
       instructions: `You are ${agent.name}, a warm, concise multilingual contact-center agent powered by HalaCX. Start by introducing yourself and asking whether now is a good time. Match the caller's language when possible. Never invent business facts. ${agent.instructions} ${scenario} Ask for the caller's name and preferred follow-up when appropriate. Approved business knowledge: ${knowledge}`,
-      audio: { input: { transcription: { model: "gpt-4o-mini-transcribe" }, turn_detection: { type: "semantic_vad" } }, output: { voice: agent.voice } }
+      output_modalities: ["audio"],
+      audio: { output: { voice: agent.voice } },
     }),
   });
   if (!response.ok) {
@@ -93,10 +106,12 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false }, { status: 502 });
   }
 
-  try {
-    await startGreeting(callId, agent.name);
-  } catch (error) {
-    console.error("OpenAI greeting failed", error);
-  }
+  after(async () => {
+    try {
+      await startGreeting(callId, agent.name);
+    } catch (error) {
+      console.error("OpenAI greeting failed", error);
+    }
+  });
   return NextResponse.json({ ok: true });
 }
