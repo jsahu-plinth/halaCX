@@ -4,6 +4,7 @@ import pg from "pg";
 import WebSocket, { WebSocketServer } from "ws";
 import { Composio } from "@composio/core";
 import { assertMediaTokenBinding, BoundedQueue, verifyMediaToken } from "./security.mjs";
+import { createAdmissionStore } from "./admission.mjs";
 
 const { Pool } = pg;
 function positiveIntegerEnv(name, fallback, minimum = 1) {
@@ -24,13 +25,18 @@ const sarvamChatModel = process.env.SARVAM_CHAT_MODEL || "sarvam-105b-conversati
 const databaseUrl = process.env.DATABASE_URL;
 const composioApiKey = process.env.COMPOSIO_API_KEY;
 const mediaStreamSecret = process.env.MEDIA_STREAM_SECRET;
+const appUrl = process.env.APP_URL?.replace(/\/$/, "");
+const internalJobSecret = process.env.INTERNAL_JOB_SECRET;
 const maxActiveCalls = positiveIntegerEnv("MAX_ACTIVE_CALLS", 250);
+const maxGlobalActiveCalls = positiveIntegerEnv("MAX_GLOBAL_ACTIVE_CALLS", 10_000);
+const maxWorkspaceActiveCalls = positiveIntegerEnv("MAX_WORKSPACE_ACTIVE_CALLS", 100);
 const maxPendingMediaConnections = positiveIntegerEnv("MAX_PENDING_MEDIA_CONNECTIONS", 25);
 const maxFrameBytes = positiveIntegerEnv("MAX_MEDIA_FRAME_BYTES", 65_536, 4_096);
 const providerConnectTimeoutMs = positiveIntegerEnv("PROVIDER_CONNECT_TIMEOUT_MS", 10_000, 1_000);
 const startTimeoutMs = positiveIntegerEnv("MEDIA_START_TIMEOUT_MS", 5_000, 1_000);
 const composio = composioApiKey ? new Composio({ apiKey: composioApiKey }) : null;
-const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, ssl: { rejectUnauthorized: false } }) : null;
+const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, connectionTimeoutMillis: 5_000, idleTimeoutMillis: 30_000, ssl: { rejectUnauthorized: false } }) : null;
+const admissionStore = createAdmissionStore({ pool, redisUrl: process.env.UPSTASH_REDIS_REST_URL, redisToken: process.env.UPSTASH_REDIS_REST_TOKEN, namespace: process.env.ADMISSION_NAMESPACE });
 
 if (!mediaStreamSecret || mediaStreamSecret.length < 32) throw new Error("MEDIA_STREAM_SECRET (at least 32 characters) is required");
 if (!["openai", "sarvam", "cartesia"].includes(voiceProvider)) throw new Error("VOICE_PROVIDER must be openai, sarvam, or cartesia");
@@ -47,7 +53,8 @@ const scenarios = {
 let draining = false;
 let activeCalls = 0;
 let pendingMediaConnections = 0;
-const usedTokenIds = new Map();
+let admissionHealthy = false;
+let jobPollTimer = null;
 
 function log(level, event, fields = {}) {
   const entry = { timestamp: new Date().toISOString(), level, event, ...fields };
@@ -58,8 +65,41 @@ function log(level, event, fields = {}) {
 
 pool?.on("error", error => log("error", "database_pool_error", { message: error.message }));
 
-function pruneTokenIds(now = Math.floor(Date.now() / 1000)) {
-  for (const [jti, exp] of usedTokenIds) if (exp < now) usedTokenIds.delete(jti);
+async function refreshAdmissionHealth() {
+  try { admissionHealthy = await admissionStore.healthCheck(); }
+  catch (error) {
+    admissionHealthy = false;
+    log("error", "admission_health_failed", { message: error.message });
+  }
+}
+
+await refreshAdmissionHealth();
+const admissionHealthTimer = setInterval(() => void refreshAdmissionHealth(), 10_000);
+admissionHealthTimer.unref();
+
+async function pollInternalJobs() {
+  if (draining || !appUrl || !internalJobSecret) return;
+  let delayMs = 2_000;
+  try {
+    for (const path of ["/api/internal/jobs/sweep", "/api/internal/jobs/post-call"]) {
+      const response = await fetch(`${appUrl}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${internalJobSecret}` },
+        signal: AbortSignal.timeout(path.endsWith("post-call") ? 310_000 : 15_000),
+      });
+      if (!response.ok) throw new Error(`${path} returned ${response.status}`);
+      const result = await response.json();
+      if (path.endsWith("post-call") && Number(result.claimed || 0) > 0) delayMs = 100;
+    }
+  } catch (error) {
+    delayMs = 10_000;
+    log("error", "internal_job_poll_failed", { message: error.message });
+  } finally {
+    if (!draining) {
+      jobPollTimer = setTimeout(() => void pollInternalJobs(), delayMs);
+      jobPollTimer.unref();
+    }
+  }
 }
 
 function rejectUpgrade(socket, status, message) {
@@ -131,7 +171,7 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (pathname === "/ready") {
-    const ready = !draining && activeCalls < maxActiveCalls;
+    const ready = !draining && admissionHealthy && activeCalls < maxActiveCalls;
     response.writeHead(ready ? 200 : 503, { "content-type": "application/json" });
     response.end(JSON.stringify({ ok: ready, activeCalls, pendingMediaConnections, capacity: maxActiveCalls, draining }));
     return;
@@ -165,6 +205,7 @@ twilioServer.on("connection", (twilio, request) => {
   let selectedVoiceProvider = voiceProvider;
   let streamSid = "";
   let callSid = "";
+  let workspaceId = "";
   let openai = null;
   let cartesia = null;
   let sarvam = null;
@@ -180,6 +221,10 @@ twilioServer.on("connection", (twilio, request) => {
   let sarvamSystemPrompt = "";
   let connectorSession = null;
   let authenticated = false;
+  let admissionInProgress = false;
+  let leaseAcquired = false;
+  let leaseRenewal = null;
+  let leaseRenewalFailures = 0;
   let pendingAdmission = true;
   let closed = false;
   let tokenPayload = request.mediaTokenPayload || null;
@@ -237,6 +282,18 @@ twilioServer.on("connection", (twilio, request) => {
     closeSocket(cartesia, 1011, reason);
     closeSocket(sarvam, 1011, reason);
     closeSocket(sarvamStt, 1011, reason);
+  }
+
+  async function renewAdmissionLease() {
+    try {
+      const renewed = await admissionStore.renew(callTraceId, 90_000, workspaceId);
+      if (!renewed) failCall("admission_lease_lost", 1013);
+      else leaseRenewalFailures = 0;
+    } catch (error) {
+      leaseRenewalFailures += 1;
+      callLog("error", "admission_lease_renewal_failed", { message: error.message });
+      if (leaseRenewalFailures >= 2) failCall("admission_lease_unavailable", 1013);
+    }
   }
 
   function queueOrFail(queue, value, name) {
@@ -670,9 +727,59 @@ Approved business knowledge: ${config.knowledge}`,
     openai.on("error", error => callLog("error", "provider_socket_error", { targetProvider: "openai", message: error.message }));
   }
 
+  async function completeAdmission(parameters) {
+    try {
+      const result = await withDeadline(admissionStore.admit({
+        jti: tokenPayload.jti,
+        tokenExpiresAt: tokenPayload.exp,
+        leaseId: callTraceId,
+        workspaceId,
+        maximum: maxGlobalActiveCalls,
+        workspaceMaximum: maxWorkspaceActiveCalls,
+        leaseMs: 90_000,
+      }), "distributed_admission_timeout");
+      if (result.status !== "admitted") return failCall(result.status === "replayed" ? "replayed_media_token" : result.status === "workspace_capacity" ? "workspace_capacity_reached" : "global_capacity_reached", 1008);
+      leaseAcquired = true;
+      if (closed) {
+        await admissionStore.release(callTraceId, workspaceId).catch(() => {});
+        return;
+      }
+      clearTimeout(startTimer);
+      authenticated = true;
+      admissionInProgress = false;
+      pendingAdmission = false;
+      pendingMediaConnections = Math.max(0, pendingMediaConnections - 1);
+      leaseRenewal = setInterval(() => void renewAdmissionLease(), 30_000);
+      leaseRenewal.unref();
+      callLog("info", "call_admitted", { hasContext: Boolean(parameters.contextId) });
+      connectCartesia();
+      if (selectedVoiceProvider === "sarvam") {
+        connectSarvamFullStack(parameters).catch(error => {
+          callLog("error", "provider_connect_failed", { targetProvider: "sarvam", message: error.message });
+          failCall("provider_connect_failed", 1013);
+        });
+      } else {
+        connectOpenAI(parameters).catch(error => {
+          callLog("error", "provider_connect_failed", { targetProvider: "openai", message: error.message });
+          failCall("provider_connect_failed", 1013);
+        });
+      }
+    } catch (error) {
+      callLog("error", "distributed_admission_failed", { message: error.message });
+      failCall("distributed_admission_unavailable", 1013);
+    }
+  }
+
   twilio.on("message", raw => {
     const event = parseFrame(raw, "twilio");
     if (!event) return;
+
+    if (admissionInProgress) {
+      if (event.event === "media" && typeof event.media?.payload === "string") queueOrFail(bufferedAudio, event.media.payload, "pre_admission_audio");
+      else if (event.event === "stop") closeSocket(twilio, 1000, "Twilio stream ended");
+      else if (event.event !== "connected") failCall("unexpected_event_during_admission", 1008);
+      return;
+    }
 
     if (!authenticated) {
       if (event.event === "connected" && event.protocol === "Call" && event.version === "1.0.0") return;
@@ -691,39 +798,23 @@ Approved business knowledge: ${config.knowledge}`,
         if (parameters.scenario && !(parameters.scenario in scenarios)) throw new Error("invalid_scenario");
         if (parameters.voiceProvider && !["openai", "sarvam", "cartesia"].includes(parameters.voiceProvider)) throw new Error("invalid_voice_provider");
         if (parameters.contextId && !/^[a-f0-9-]{20,64}$/i.test(parameters.contextId)) throw new Error("invalid_context_id");
+        if (!parameters.workspaceId || !(parameters.workspaceId === "public-demo" || /^[a-f0-9-]{36}$/i.test(parameters.workspaceId))) throw new Error("invalid_workspace_id");
         assertMediaTokenBinding(tokenPayload, event.start);
-        pruneTokenIds();
-        if (usedTokenIds.has(tokenPayload.jti)) throw new Error("replayed_token");
-        usedTokenIds.set(tokenPayload.jti, tokenPayload.exp);
       } catch (error) {
         callLog("warn", "media_auth_rejected", { reason: error.message });
         return failCall("invalid_start_parameters", 1008);
       }
 
-      clearTimeout(startTimer);
       streamSid = event.start.streamSid;
       callSid = event.start.callSid;
-      authenticated = true;
-      pendingAdmission = false;
-      pendingMediaConnections = Math.max(0, pendingMediaConnections - 1);
+      workspaceId = parameters.workspaceId;
       const requestedProvider = parameters.voiceProvider;
       if (["openai", "sarvam", "cartesia"].includes(requestedProvider)) selectedVoiceProvider = requestedProvider;
       if (["openai", "cartesia"].includes(selectedVoiceProvider) && !apiKey) return failCall("openai_not_configured", 1013);
       if (selectedVoiceProvider === "cartesia" && !cartesiaApiKey) return failCall("cartesia_not_configured", 1013);
       if (selectedVoiceProvider === "sarvam" && !sarvamApiKey) return failCall("sarvam_not_configured", 1013);
-      callLog("info", "call_admitted", { hasContext: Boolean(parameters.contextId) });
-      connectCartesia();
-      if (selectedVoiceProvider === "sarvam") {
-        connectSarvamFullStack(parameters).catch(error => {
-          callLog("error", "provider_connect_failed", { targetProvider: "sarvam", message: error.message });
-          failCall("provider_connect_failed", 1013);
-        });
-      } else {
-        connectOpenAI(parameters).catch(error => {
-          callLog("error", "provider_connect_failed", { targetProvider: "openai", message: error.message });
-          failCall("provider_connect_failed", 1013);
-        });
-      }
+      admissionInProgress = true;
+      void completeAdmission(parameters);
       return;
     }
 
@@ -748,6 +839,7 @@ Approved business knowledge: ${config.knowledge}`,
     if (pendingAdmission) pendingMediaConnections = Math.max(0, pendingMediaConnections - 1);
     clearTimeout(startTimer);
     clearProviderTimers();
+    if (leaseRenewal) clearInterval(leaseRenewal);
     bufferedAudio.clear();
     cartesiaQueue.clear();
     sarvamQueue.clear();
@@ -756,16 +848,23 @@ Approved business knowledge: ${config.knowledge}`,
     closeSocket(cartesia, 1000, "Caller disconnected");
     closeSocket(sarvam, 1000, "Caller disconnected");
     closeSocket(sarvamStt, 1000, "Caller disconnected");
+    if (leaseAcquired) void admissionStore.release(callTraceId, workspaceId).catch(error => callLog("error", "admission_release_failed", { message: error.message }));
     callLog("info", "call_closed", { code, reason: reason.toString(), activeCalls });
   });
   twilio.on("error", error => callLog("error", "twilio_socket_error", { message: error.message }));
 });
 
-server.listen(port, "0.0.0.0", () => log("info", "worker_started", { port, capacity: maxActiveCalls }));
+server.listen(port, "0.0.0.0", () => {
+  log("info", "worker_started", { port, capacity: maxActiveCalls, globalCapacity: maxGlobalActiveCalls, workspaceCapacity: maxWorkspaceActiveCalls });
+  if (appUrl && internalJobSecret) void pollInternalJobs();
+  else log("warn", "internal_job_poller_disabled", { hasAppUrl: Boolean(appUrl), hasSecret: Boolean(internalJobSecret) });
+});
 
 function beginDrain(signal) {
   if (draining) return;
   draining = true;
+  clearInterval(admissionHealthTimer);
+  if (jobPollTimer) clearTimeout(jobPollTimer);
   let shutdownStarted = false;
   const finish = code => {
     if (shutdownStarted) return;

@@ -29,6 +29,7 @@ export function assertMediaTokenBinding(payload, start) {
     ["callSid", start?.callSid],
     ["contextId", parameters.contextId],
     ["internalCallId", parameters.internalCallId],
+    ["workspaceId", parameters.workspaceId],
     ["scenario", parameters.scenario],
     ["voiceProvider", parameters.voiceProvider],
   ];

@@ -9,7 +9,8 @@
     "test": "node --no-warnings --experimental-strip-types --test tests/*.test.mjs",
     "lint": "eslint .",
     "db:migrate": "node --env-file=.env.local scripts/migrate.mjs",
-    "backend:verify": "node --env-file=.env.local scripts/verify-backend.mjs"
+    "backend:verify": "node --env-file=.env.local scripts/verify-backend.mjs",
+    "jobs:post-call": "node --env-file=.env.local scripts/run-post-call-worker.mjs"
   },
   "dependencies": {
     "@composio/core": "^0.18.0",

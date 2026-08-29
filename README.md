@@ -8,7 +8,11 @@ The live voice worker exposes the same two-function contract to every supported 
 
 Set `COMPOSIO_API_KEY` in both the web deployment and the Railway voice worker, run `npm run db:migrate`, then connect apps from the dashboard.
 
-`lib/tools` now defines a provider-neutral gateway boundary. Only catalogued, schema-valid, workspace-allowed read capabilities may execute. Write capabilities remain blocked until durable confirmation, policy, audit, idempotency, and authoritative verification stores are connected.
+`lib/tools` defines a provider-neutral gateway boundary with durable policy versions, execution records, confirmation proofs, idempotency leases, and ordered audit events. Only catalogued, schema-valid, workspace-allowed read capabilities may execute. Write capabilities remain blocked in both application code and database policy until the verified write executor is complete.
+
+## Production knowledge retrieval
+
+`lib/rag` contains the tenant-scoped retrieval foundation: immutable document versions, ACL-aware chunks, pgvector similarity, PostgreSQL full-text search, weighted rank fusion, bounded context, and exact citations. Retrieval is not yet connected to live calls because ingestion workers, embedding generation, reranking, cache policy, and corpus evaluation must be completed first. The live worker continues using the existing bounded knowledge path until those gates pass.
 
 A multilingual AI call-center platform built with Next.js, PostgreSQL/Supabase, Twilio Voice, and OpenAI Realtime. HalaCX includes account authentication, workspace and agent configuration, a knowledge base, outbound demo calls, signed provider webhooks, and a call dashboard with recordings, transcripts, summaries, and outcomes.
 
@@ -32,9 +36,11 @@ Copy `.env.example` to `.env.local`, supply the required values, run `npm run db
 
 5. Use an E.164 phone number such as `+971501234567` in the dashboard.
 
-The call endpoint asks Twilio to call the mobile number and stream media to the persistent voice worker. An expiring signed admission token is validated before the worker opens a paid model or speech connection. A private context identifier correlates the call with the correct workspace, agent, knowledge, and scenario. Signed Twilio callbacks are persisted idempotently and reduced through a monotonic call-state transition. Recording callbacks are deduplicated before post-call transcription and analysis.
+Inbound numbers must first be assigned through `/api/phone-numbers`. The server verifies that the number belongs to the configured Twilio account, binds it to one workspace and agent, and configures Twilio's voice and status callback URLs. Unmapped inbound numbers fail closed and never receive another workspace's knowledge.
 
-Post-call processing currently uses Next.js `after()` as an intermediate asynchronous step. A durable queue and recovery worker are still required before high-volume production.
+The call endpoint asks Twilio to call the mobile number and stream media to the persistent voice worker. An expiring signed admission token is validated before the worker opens a paid model or speech connection. The token binds the call, workspace, agent context, scenario, and selected provider. Distributed admission enforces replay protection plus global and per-workspace capacity using Redis when configured, with a safe PostgreSQL fallback. Signed Twilio callbacks are persisted idempotently and reduced through a monotonic call-state transition.
+
+Recording callbacks now acknowledge after durable persistence and enqueue transcription and analysis in `durable_jobs`. The worker claims jobs with `SKIP LOCKED`, renews leases, retries with exponential delay, dead-letters exhausted jobs, and recovers expired leases. Configure the same `INTERNAL_JOB_SECRET` on the web app and job runner. The Railway voice worker can poll the protected job endpoints when both `APP_URL` and `INTERNAL_JOB_SECRET` are set; a separate runner can use `npm run jobs:post-call`.
 
 ## Verification
 
@@ -51,6 +57,8 @@ To verify a deployed build, set `VERIFY_BASE_URL=https://your-domain.example` wh
 
 - Rotate credentials before launch and never commit `.env.local`.
 - Configure the same `MEDIA_STREAM_SECRET` in the web and voice-worker deployments.
+- Configure the same `INTERNAL_JOB_SECRET` in the web deployment and post-call runner.
+- Configure Upstash Redis for non-serialized admission at high concurrency. PostgreSQL fallback is safe but is not the 10,000-call target.
 - Configure the OpenAI incoming-call webhook as `https://YOUR_DOMAIN/api/openai/incoming`.
 - Configure Google OAuth with `https://YOUR_DOMAIN/api/auth/google/callback`.
 - Run the database migration once with `DIRECT_URL`; use the pooled `DATABASE_URL` at runtime.

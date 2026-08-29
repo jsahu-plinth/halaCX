@@ -4,6 +4,7 @@ type MediaTokenClaims = {
   callSid?: string;
   contextId?: string;
   internalCallId?: string;
+  workspaceId?: string;
   scenario?: string;
   voiceProvider?: string;
 };

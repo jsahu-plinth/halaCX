@@ -675,6 +675,88 @@
 .sectionHeader svg {
   width: 13px;
 }
+.numberManager {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.numberForm {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.4fr) minmax(150px, 0.8fr) minmax(120px, 0.6fr) auto;
+  gap: 10px;
+  padding: 14px;
+  background: #f7f9f8;
+}
+.numberForm input,
+.numberForm select {
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font: 500 12px var(--font-geist-sans);
+  outline: none;
+}
+.numberForm input::placeholder {
+  color: var(--subtle);
+}
+.numberForm input:focus,
+.numberForm select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(79, 95, 224, 0.12);
+}
+.numberList article,
+.numberEmpty {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 70px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+}
+.numberIcon,
+.numberEmpty > svg {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: #eef1ff;
+  color: var(--accent);
+}
+.numberIcon svg {
+  width: 17px;
+}
+.numberEmpty > svg {
+  padding: 10px;
+}
+.numberList strong {
+  font-size: 12px;
+}
+.numberList p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+.numberList small {
+  display: block;
+  margin-top: 4px;
+  color: #b42318;
+  font-size: 10px;
+}
+.numberEmpty {
+  grid-template-columns: 40px minmax(0, 1fr);
+  min-height: 86px;
+}
+.numberManager > .error {
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid #fecdca;
+  background: #fffbfa;
+}
 .integrations {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1194,6 +1276,16 @@
   .sectionHeader {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .numberForm {
+    grid-template-columns: 1fr;
+  }
+  .numberList article {
+    grid-template-columns: 38px minmax(0, 1fr) auto;
+  }
+  .numberList article > button {
+    grid-column: 2 / -1;
+    justify-self: start;
   }
   .integrations article {
     grid-template-columns: 36px minmax(0, 1fr) auto;

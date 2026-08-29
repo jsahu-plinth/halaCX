@@ -27,6 +27,7 @@ try {
   results.knowledgeDelete = (await request(`/api/knowledge/${knowledge.body.source?.id}`, { method: "DELETE" })).status;
   results.agentUpdate = (await request("/api/agent", { method: "PATCH", body: JSON.stringify({ instructions: "Answer only from approved workspace knowledge and escalate uncertain requests to a human." }) })).status;
   results.workspace = (await request("/api/workspace")).status;
+  results.phoneNumbers = (await request("/api/phone-numbers")).status;
   results.logout = (await request("/api/auth/logout", { method: "POST" })).status;
   cookie = "";
   results.login = (await request("/api/auth/login", { method: "POST", body: JSON.stringify({ email, password }) })).status;

@@ -1,5 +1,6 @@
 .env*
 !.env.example
 .next/
+*.tsbuildinfo
 node_modules/
 .vercel

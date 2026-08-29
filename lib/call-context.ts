@@ -21,6 +21,17 @@ export function contextInstructions(context: string) {
 export async function createPendingCallContext(value: string, workspaceId?: string, callId?: string) {
   const context = normalizeContext(value);
   if (!isDatabaseConfigured) return { id: null, context };
+  if (callId) {
+    const result = await query<{ id: string }>(
+      `insert into pending_call_contexts(workspace_id,call_id,context,expires_at)
+       values($1,$2,$3,now()+interval '15 minutes')
+       on conflict(call_id) where call_id is not null do update
+         set workspace_id=excluded.workspace_id,context=excluded.context,expires_at=excluded.expires_at
+       returning id`,
+      [workspaceId || null, callId, context],
+    );
+    return { id: result.rows[0].id, context };
+  }
   const result = await query<{ id: string }>(
     "insert into pending_call_contexts(workspace_id,call_id,context,expires_at) values($1,$2,$3,now()+interval '15 minutes') returning id",
     [workspaceId || null, callId || null, context],

@@ -54,12 +54,14 @@ export async function POST(request: Request) {
   const mediaToken = createMediaStreamToken({
     contextId: pending.id || undefined,
     internalCallId: internalCallId || undefined,
+    workspaceId: session && !session.preview ? session.workspaceId : "public-demo",
     scenario: pending.context,
     voiceProvider: parsed.data.voiceProvider,
   });
   const contextParameter = pending.id ? `<Parameter name="contextId" value="${pending.id}"/>` : "";
   const internalCallParameter = internalCallId ? `<Parameter name="internalCallId" value="${internalCallId}"/>` : "";
-  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}${internalCallParameter}<Parameter name="scenario" value="${pending.context}"/><Parameter name="voiceProvider" value="${parsed.data.voiceProvider}"/><Parameter name="mediaToken" value="${mediaToken}"/></Stream></Connect></Response>`;
+  const workspaceId = session && !session.preview ? session.workspaceId : "public-demo";
+  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}${internalCallParameter}<Parameter name="workspaceId" value="${workspaceId}"/><Parameter name="scenario" value="${pending.context}"/><Parameter name="voiceProvider" value="${parsed.data.voiceProvider}"/><Parameter name="mediaToken" value="${mediaToken}"/></Stream></Connect></Response>`;
   const body = new URLSearchParams({
     To: parsed.data.phone,
     From: from,

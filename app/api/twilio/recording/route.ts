@@ -1,52 +1,13 @@
 import { createHash } from "node:crypto";
-import { after, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { isDatabaseConfigured, query } from "@/lib/db";
+import { enqueueJob } from "@/lib/jobs";
 import { validateTwilioWebhook } from "@/lib/twilio";
-import { processCallRecording } from "@/lib/post-call";
-
-export const maxDuration = 300;
 
 function eventKey(data: Record<string, FormDataEntryValue>) {
   const canonical = Object.keys(data).sort().map(key => `${key}=${String(data[key])}`).join("&");
   const fingerprint = createHash("sha256").update(canonical).digest("hex");
   return `recording:${String(data.RecordingSid || fingerprint)}:${String(data.RecordingStatus || "completed")}`;
-}
-
-async function processRecordingEvent(eventId: string, callId: string, recordingUrl: string) {
-  const claimed = await query<{ id: string }>(
-    `update provider_webhook_events
-     set status='processing',processing_started_at=now(),attempt_count=attempt_count+1,last_error=null
-     where id=$1 and (status in ('received','failed') or (status='processing' and processing_started_at<now()-interval '5 minutes'))
-     returning id`,
-    [eventId],
-  );
-  if (!claimed.rows[0]) return;
-
-  try {
-    const completed = await query<{ exists: boolean }>(
-      "select exists(select 1 from call_events where call_id=$1 and event_type='postcall.completed') as exists",
-      [callId],
-    );
-    if (!completed.rows[0]?.exists) await processCallRecording(callId, recordingUrl);
-    await query(
-      "update provider_webhook_events set status='processed',processed_at=now(),processing_started_at=null,last_error=null where id=$1",
-      [eventId],
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown post-call processing error";
-    console.error("Post-call processing failed", { callId, eventId, message });
-    await query(
-      "update provider_webhook_events set status='failed',processing_started_at=null,last_error=$1 where id=$2",
-      [message.slice(0, 2_000), eventId],
-    );
-    await query(
-      `insert into call_events(call_id,provider_event_id,event_type,payload)
-       values($1,$2,'postcall.failed',$3::jsonb)
-       on conflict(provider_event_id) where provider_event_id is not null
-       do update set payload=excluded.payload,created_at=now()`,
-      [callId, `postcall-failed:${eventId}`, JSON.stringify({ message })],
-    );
-  }
 }
 
 export async function POST(request: Request) {
@@ -90,8 +51,6 @@ export async function POST(request: Request) {
      on conflict(provider_event_id) where provider_event_id is not null do nothing`,
     [result.rows[0].id, `twilio:${key}`, payload],
   );
-  if (event.rows[0].status !== "processed") {
-    after(() => processRecordingEvent(event.rows[0].id, result.rows[0].id, recordingUrl));
-  }
+  if (event.rows[0].status !== "processed") await enqueueJob("post-call", event.rows[0].id, { eventId: event.rows[0].id, callId: result.rows[0].id, recordingUrl });
   return NextResponse.json({ ok: true, duplicate: event.rows[0].status === "processed" });
 }
