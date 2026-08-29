@@ -23,24 +23,27 @@ export async function POST(request: Request) {
   const apiKeySecret = process.env.TWILIO_API_KEY_SECRET;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
   const from = process.env.TWILIO_PHONE_NUMBER;
-  const projectId = process.env.OPENAI_PROJECT_ID;
   const appUrl = process.env.APP_URL;
+  const voiceUrl = process.env.VOICE_WS_URL;
 
   const username = apiKeySid || sid;
   const password = apiKeySecret || authToken;
 
-  if (!sid || !username || !password || !from || !projectId || !appUrl) {
+  if (!sid || !username || !password || !from || !appUrl || !voiceUrl) {
     return NextResponse.json({ error: "Voice providers are not fully configured." }, { status: 503 });
   }
 
   const pending = await createPendingCallContext(parsed.data.context, session && !session.preview ? session.workspaceId : undefined);
-  const sipContextHeader = pending.id ? `?x-halacx-context=${encodeURIComponent(pending.id)}` : "";
-  const twiml = `<Response><Dial action="${appUrl}/api/twilio/dial" method="POST" record="record-from-answer-dual" recordingStatusCallback="${appUrl}/api/twilio/recording"><Sip statusCallback="${appUrl}/api/twilio/status" statusCallbackEvent="initiated ringing answered completed" method="POST">sip:${projectId}@sip.api.openai.com;transport=tls${sipContextHeader}</Sip></Dial></Response>`;
+  const contextParameter = pending.id ? `<Parameter name="contextId" value="${pending.id}"/>` : "";
+  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}<Parameter name="scenario" value="${pending.context}"/></Stream></Connect></Response>`;
   const body = new URLSearchParams({
     To: parsed.data.phone,
     From: from,
     Twiml: twiml,
     StatusCallback: `${appUrl}/api/twilio/status`,
+    Record: "true",
+    RecordingChannels: "dual",
+    RecordingStatusCallback: `${appUrl}/api/twilio/recording`,
   });
   for (const event of ["initiated", "ringing", "answered", "completed"]) {
     body.append("StatusCallbackEvent", event);
