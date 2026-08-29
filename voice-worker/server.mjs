@@ -3,8 +3,14 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import WebSocket, { WebSocketServer } from "ws";
 import { Composio } from "@composio/core";
+import { assertMediaTokenBinding, BoundedQueue, verifyMediaToken } from "./security.mjs";
 
 const { Pool } = pg;
+function positiveIntegerEnv(name, fallback, minimum = 1) {
+  const value = Number(process.env[name] || fallback);
+  return Number.isSafeInteger(value) && value >= minimum ? value : fallback;
+}
+
 const port = Number(process.env.PORT || 8080);
 const apiKey = process.env.OPENAI_API_KEY;
 const voiceProvider = process.env.VOICE_PROVIDER || "openai";
@@ -17,10 +23,17 @@ const sarvamSttModel = process.env.SARVAM_STT_MODEL || "saaras:v3";
 const sarvamChatModel = process.env.SARVAM_CHAT_MODEL || "sarvam-105b-conversations";
 const databaseUrl = process.env.DATABASE_URL;
 const composioApiKey = process.env.COMPOSIO_API_KEY;
+const mediaStreamSecret = process.env.MEDIA_STREAM_SECRET;
+const maxActiveCalls = positiveIntegerEnv("MAX_ACTIVE_CALLS", 250);
+const maxPendingMediaConnections = positiveIntegerEnv("MAX_PENDING_MEDIA_CONNECTIONS", 25);
+const maxFrameBytes = positiveIntegerEnv("MAX_MEDIA_FRAME_BYTES", 65_536, 4_096);
+const providerConnectTimeoutMs = positiveIntegerEnv("PROVIDER_CONNECT_TIMEOUT_MS", 10_000, 1_000);
+const startTimeoutMs = positiveIntegerEnv("MEDIA_START_TIMEOUT_MS", 5_000, 1_000);
 const composio = composioApiKey ? new Composio({ apiKey: composioApiKey }) : null;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, ssl: { rejectUnauthorized: false } }) : null;
 
-if (!apiKey) throw new Error("OPENAI_API_KEY is required");
+if (!mediaStreamSecret || mediaStreamSecret.length < 32) throw new Error("MEDIA_STREAM_SECRET (at least 32 characters) is required");
+if (!["openai", "sarvam", "cartesia"].includes(voiceProvider)) throw new Error("VOICE_PROVIDER must be openai, sarvam, or cartesia");
 if (voiceProvider === "cartesia" && !cartesiaApiKey) throw new Error("CARTESIA_API_KEY is required when VOICE_PROVIDER=cartesia");
 if (voiceProvider === "sarvam" && !sarvamApiKey) throw new Error("SARVAM_API_KEY is required when VOICE_PROVIDER=sarvam");
 
@@ -30,6 +43,30 @@ const scenarios = {
   lead: "Act as a helpful lead qualification agent. Ask about the caller's company, need, urgency, and preferred next step.",
   support: "Act as a customer-support agent. Ask for the issue and reference number, explain the next action, and escalate when human judgment is needed."
 };
+
+let draining = false;
+let activeCalls = 0;
+let pendingMediaConnections = 0;
+const usedTokenIds = new Map();
+
+function log(level, event, fields = {}) {
+  const entry = { timestamp: new Date().toISOString(), level, event, ...fields };
+  const output = JSON.stringify(entry);
+  if (level === "error") console.error(output);
+  else console.log(output);
+}
+
+pool?.on("error", error => log("error", "database_pool_error", { message: error.message }));
+
+function pruneTokenIds(now = Math.floor(Date.now() / 1000)) {
+  for (const [jti, exp] of usedTokenIds) if (exp < now) usedTokenIds.delete(jti);
+}
+
+function rejectUpgrade(socket, status, message) {
+  if (!socket.writable) return socket.destroy();
+  const body = `${message}\n`;
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+}
 
 function mulawToPcm16(base64) {
   const input = Buffer.from(base64, "base64");
@@ -60,7 +97,7 @@ async function loadContext(contextId, fallbackScenario) {
   const client = await pool.connect();
   try {
     await client.query("begin");
-    const pending = await client.query("delete from pending_call_contexts where id=$1 and expires_at>now() returning workspace_id,context,provider_call_id", [contextId]);
+    const pending = await client.query("select workspace_id,context,provider_call_id,call_id from pending_call_contexts where id=$1 and expires_at>now()", [contextId]);
     const row = pending.rows[0];
     if (!row?.workspace_id) { await client.query("commit"); return { ...base, scenario: row?.context || base.scenario }; }
     const [agent, knowledge, connectors] = await Promise.all([
@@ -79,7 +116,7 @@ async function loadContext(contextId, fallbackScenario) {
     };
   } catch (error) {
     await client.query("rollback");
-    console.error("context_load_failed", error.message);
+    log("error", "context_load_failed", { contextId, message: error.message });
     return base;
   } finally {
     client.release();
@@ -87,23 +124,47 @@ async function loadContext(contextId, fallbackScenario) {
 }
 
 const server = http.createServer((request, response) => {
-  if (request.url === "/health") {
+  const pathname = new URL(request.url, "http://localhost").pathname;
+  if (pathname === "/live" || pathname === "/health") {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true }));
+    response.end(JSON.stringify({ ok: true, activeCalls, pendingMediaConnections, draining }));
+    return;
+  }
+  if (pathname === "/ready") {
+    const ready = !draining && activeCalls < maxActiveCalls;
+    response.writeHead(ready ? 200 : 503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: ready, activeCalls, pendingMediaConnections, capacity: maxActiveCalls, draining }));
     return;
   }
   response.writeHead(404).end();
 });
 
-const twilioServer = new WebSocketServer({ noServer: true });
+const twilioServer = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes, perMessageDeflate: false });
 server.on("upgrade", (request, socket, head) => {
-  if (new URL(request.url, "http://localhost").pathname !== "/twilio-media") return socket.destroy();
+  const url = new URL(request.url, "http://localhost");
+  if (url.pathname !== "/twilio-media") return rejectUpgrade(socket, "404 Not Found", "Not found");
+  if (draining) return rejectUpgrade(socket, "503 Service Unavailable", "Worker is draining");
+  if (activeCalls >= maxActiveCalls) return rejectUpgrade(socket, "503 Service Unavailable", "Worker is at capacity");
+  if (pendingMediaConnections >= maxPendingMediaConnections) return rejectUpgrade(socket, "503 Service Unavailable", "Too many pending media connections");
+  const queryToken = url.searchParams.get("token");
+  if (queryToken) {
+    try {
+      request.mediaTokenPayload = verifyMediaToken(queryToken, mediaStreamSecret);
+    } catch (error) {
+      log("warn", "media_upgrade_rejected", { reason: error.message, remoteAddress: request.socket.remoteAddress });
+      return rejectUpgrade(socket, "401 Unauthorized", "Invalid media token");
+    }
+  }
   twilioServer.handleUpgrade(request, socket, head, ws => twilioServer.emit("connection", ws, request));
 });
 
-twilioServer.on("connection", twilio => {
+twilioServer.on("connection", (twilio, request) => {
+  activeCalls += 1;
+  pendingMediaConnections += 1;
+  const callTraceId = randomUUID();
   let selectedVoiceProvider = voiceProvider;
   let streamSid = "";
+  let callSid = "";
   let openai = null;
   let cartesia = null;
   let sarvam = null;
@@ -111,9 +172,6 @@ twilioServer.on("connection", twilio => {
   let ready = false;
   let greetingSent = false;
   let cartesiaContextId = "";
-  const bufferedAudio = [];
-  const cartesiaQueue = [];
-  const sarvamQueue = [];
   let sarvamGeneration = 0;
   let sarvamSpeaking = false;
   let sarvamTextBuffer = "";
@@ -121,15 +179,102 @@ twilioServer.on("connection", twilio => {
   let sarvamMessages = [];
   let sarvamSystemPrompt = "";
   let connectorSession = null;
+  let authenticated = false;
+  let pendingAdmission = true;
+  let closed = false;
+  let tokenPayload = request.mediaTokenPayload || null;
+  const bufferedAudio = new BoundedQueue({ maxItems: 500, maxBytes: 2 * 1024 * 1024 });
+  const cartesiaQueue = new BoundedQueue({ maxItems: 100, maxBytes: 512 * 1024 });
+  const sarvamQueue = new BoundedQueue({ maxItems: 100, maxBytes: 512 * 1024 });
+  const providerTimers = new Set();
+  const startTimer = setTimeout(() => failCall("media_start_timeout", 1008), startTimeoutMs);
+
+  function callLog(level, event, fields = {}) {
+    log(level, event, { callTraceId, callSid: callSid || undefined, streamSid: streamSid || undefined, provider: selectedVoiceProvider, ...fields });
+  }
+
+  function closeSocket(socket, code, reason) {
+    if (socket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(socket.readyState)) socket.close(code, reason);
+  }
+
+  function clearProviderTimers() {
+    for (const timer of providerTimers) clearTimeout(timer);
+    providerTimers.clear();
+  }
+
+  function armProviderTimeout(socket, provider) {
+    const timer = setTimeout(() => {
+      providerTimers.delete(timer);
+      callLog("error", "provider_connect_timeout", { targetProvider: provider });
+      closeSocket(socket, 1013, "Provider connection timeout");
+      failCall("provider_unavailable", 1013);
+    }, providerConnectTimeoutMs);
+    providerTimers.add(timer);
+    socket.once("open", () => { clearTimeout(timer); providerTimers.delete(timer); });
+    socket.once("close", () => { clearTimeout(timer); providerTimers.delete(timer); });
+  }
+
+  async function withDeadline(promise, label) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(label)), providerConnectTimeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function failCall(reason, code = 1011) {
+    if (closed) return;
+    callLog("error", "call_failed", { reason });
+    closeSocket(twilio, code, reason.slice(0, 120));
+    closeSocket(openai, 1011, reason);
+    closeSocket(cartesia, 1011, reason);
+    closeSocket(sarvam, 1011, reason);
+    closeSocket(sarvamStt, 1011, reason);
+  }
+
+  function queueOrFail(queue, value, name) {
+    if (queue.push(value)) return true;
+    callLog("error", "queue_overflow", { queue: name, queuedItems: queue.length });
+    failCall(`${name}_overflow`, 1009);
+    return false;
+  }
+
+  function parseFrame(raw, source) {
+    try {
+      return JSON.parse(raw.toString());
+    } catch {
+      callLog("warn", "malformed_frame", { source });
+      failCall(`malformed_${source}_frame`, 1007);
+      return null;
+    }
+  }
+
+  function safeSend(socket, message, target) {
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    if (socket.bufferedAmount > 1024 * 1024) {
+      callLog("error", "socket_backpressure", { target, bufferedBytes: socket.bufferedAmount });
+      failCall(`${target}_backpressure`, 1009);
+      return false;
+    }
+    socket.send(message);
+    return true;
+  }
 
   function sendOpenAI(payload) {
-    if (openai?.readyState === WebSocket.OPEN) openai.send(JSON.stringify(payload));
+    safeSend(openai, JSON.stringify(payload), "openai");
   }
 
   function sendCartesia(payload) {
     const message = JSON.stringify(payload);
-    if (cartesia?.readyState === WebSocket.OPEN) cartesia.send(message);
-    else cartesiaQueue.push(message);
+    if (cartesia?.readyState === WebSocket.OPEN) safeSend(cartesia, message, "cartesia");
+    else queueOrFail(cartesiaQueue, message, "cartesia_queue");
   }
 
   function connectCartesia() {
@@ -137,19 +282,21 @@ twilioServer.on("connection", twilio => {
     cartesia = new WebSocket("wss://api.cartesia.ai/tts/websocket?cartesia_version=2026-03-01", {
       headers: { Authorization: `Bearer ${cartesiaApiKey}` }
     });
+    armProviderTimeout(cartesia, "cartesia");
     cartesia.on("open", () => {
-      for (const message of cartesiaQueue.splice(0)) cartesia.send(message);
-      console.log("cartesia_connected", { streamSid });
+      for (const message of cartesiaQueue.drain()) safeSend(cartesia, message, "cartesia");
+      callLog("info", "provider_connected", { targetProvider: "cartesia" });
     });
     cartesia.on("message", raw => {
-      const event = JSON.parse(raw.toString());
+      const event = parseFrame(raw, "cartesia");
+      if (!event) return;
       if (event.type === "chunk" && event.data && twilio.readyState === WebSocket.OPEN) {
-        twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.data } }));
+        safeSend(twilio, JSON.stringify({ event: "media", streamSid, media: { payload: event.data } }), "twilio");
       }
-      if (event.type === "error") console.error("cartesia_error", event.error || event.message || event);
+      if (event.type === "error") callLog("error", "provider_error", { targetProvider: "cartesia", code: event.error?.code || event.type });
     });
-    cartesia.on("error", error => console.error("cartesia_socket_error", error.message));
-    cartesia.on("close", (code, reason) => console.log("cartesia_closed", { streamSid, code, reason: reason.toString() }));
+    cartesia.on("error", error => callLog("error", "provider_socket_error", { targetProvider: "cartesia", message: error.message }));
+    cartesia.on("close", (code, reason) => callLog("info", "provider_closed", { targetProvider: "cartesia", code, reason: reason.toString() }));
   }
 
   function streamTextToCartesia(text, isFinal = false) {
@@ -169,8 +316,8 @@ twilioServer.on("connection", twilio => {
 
   function sendSarvam(payload) {
     const message = JSON.stringify(payload);
-    if (sarvam?.readyState === WebSocket.OPEN) sarvam.send(message);
-    else sarvamQueue.push(message);
+    if (sarvam?.readyState === WebSocket.OPEN) safeSend(sarvam, message, "sarvam_tts");
+    else queueOrFail(sarvamQueue, message, "sarvam_queue");
   }
 
   function connectSarvam() {
@@ -179,6 +326,7 @@ twilioServer.on("connection", twilio => {
     sarvam = new WebSocket("wss://api.sarvam.ai/text-to-speech/ws?model=bulbul%3Av3&send_completion_event=true", {
       headers: { "Api-Subscription-Key": sarvamApiKey }
     });
+    armProviderTimeout(sarvam, "sarvam_tts");
     sarvam.on("open", () => {
       sendSarvam({
         type: "config",
@@ -192,21 +340,22 @@ twilioServer.on("connection", twilio => {
           speech_sample_rate: 8000
         }
       });
-      for (const message of sarvamQueue.splice(0)) sarvam.send(message);
-      console.log("sarvam_connected", { streamSid, speaker: sarvamSpeaker, language: sarvamLanguage });
+      for (const message of sarvamQueue.drain()) safeSend(sarvam, message, "sarvam_tts");
+      callLog("info", "provider_connected", { targetProvider: "sarvam_tts", speaker: sarvamSpeaker, language: sarvamLanguage });
     });
     sarvam.on("message", raw => {
       if (generation !== sarvamGeneration) return;
-      const event = JSON.parse(raw.toString());
+      const event = parseFrame(raw, "sarvam_tts");
+      if (!event) return;
       if (event.type === "audio" && event.data?.audio && twilio.readyState === WebSocket.OPEN) {
         sarvamSpeaking = true;
-        twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.data.audio } }));
+        safeSend(twilio, JSON.stringify({ event: "media", streamSid, media: { payload: event.data.audio } }), "twilio");
       }
       if (["completion", "completed"].includes(event.type)) sarvamSpeaking = false;
-      if (event.type === "error") console.error("sarvam_error", event.data?.code, event.data?.message || event);
+      if (event.type === "error") callLog("error", "provider_error", { targetProvider: "sarvam_tts", code: event.data?.code });
     });
-    sarvam.on("error", error => console.error("sarvam_socket_error", error.message));
-    sarvam.on("close", (code, reason) => console.log("sarvam_closed", { streamSid, code, reason: reason.toString() }));
+    sarvam.on("error", error => callLog("error", "provider_socket_error", { targetProvider: "sarvam_tts", message: error.message }));
+    sarvam.on("close", (code, reason) => callLog("info", "provider_closed", { targetProvider: "sarvam_tts", code, reason: reason.toString() }));
   }
 
   function streamTextToSarvam(text, isFinal = false) {
@@ -237,7 +386,7 @@ twilioServer.on("connection", twilio => {
       sarvam.close(1000, "Caller interrupted");
       sarvam = null;
       sarvamSpeaking = false;
-      sarvamQueue.length = 0;
+      sarvamQueue.clear();
       sarvamTextBuffer = "";
       connectSarvam();
     }
@@ -246,15 +395,17 @@ twilioServer.on("connection", twilio => {
   async function setupConnectorSession(config) {
     if (!composio || !config.workspaceId || !config.connectorToolkits.length) return;
     try {
-      connectorSession = await composio.sessions.create(`halacx_workspace_${config.workspaceId}`, {
+      const session = await composio.sessions.create(`halacx_workspace_${config.workspaceId}`, {
         toolkits: { enable: config.connectorToolkits },
         tags: { enable: ["readOnlyHint"] },
         manageConnections: false
       });
-      console.log("connector_session_ready", { streamSid, toolkits: config.connectorToolkits });
+      if (closed) return;
+      connectorSession = session;
+      callLog("info", "connector_session_ready", { toolkits: config.connectorToolkits });
     } catch (error) {
       connectorSession = null;
-      console.error("connector_session_failed", error.message);
+      callLog("error", "connector_session_failed", { message: error.message });
     }
   }
 
@@ -343,7 +494,12 @@ twilioServer.on("connection", twilio => {
           if (!line.startsWith("data: ")) continue;
           const payload = line.slice(6).trim();
           if (!payload || payload === "[DONE]") continue;
-          const event = JSON.parse(payload);
+          let event;
+          try { event = JSON.parse(payload); }
+          catch {
+            callLog("warn", "malformed_frame", { source: "sarvam_chat_stream" });
+            continue;
+          }
           const text = event.choices?.[0]?.delta?.content;
           if (text) {
             assistantText += text;
@@ -355,13 +511,14 @@ twilioServer.on("connection", twilio => {
       if (assistantText.trim()) sarvamMessages.push({ role: "assistant", content: assistantText.trim() });
       sarvamMessages = sarvamMessages.slice(-12);
     } catch (error) {
-      if (error.name !== "AbortError") console.error("sarvam_chat_error", error.message);
+      if (error.name !== "AbortError") callLog("error", "sarvam_chat_error", { message: error.message });
     }
   }
 
   async function connectSarvamFullStack(parameters = {}) {
-    const config = await loadContext(parameters.contextId, parameters.scenario);
-    await setupConnectorSession(config);
+    const config = await withDeadline(loadContext(parameters.contextId, parameters.scenario), "context_load_timeout");
+    await withDeadline(setupConnectorSession(config), "connector_setup_timeout");
+    if (closed) return;
     sarvamSystemPrompt = `You are ${config.name}, a warm, concise HalaCX receptionist. ${config.instructions} ${scenarios[config.scenario]}
 
 Conversation rules:
@@ -392,38 +549,42 @@ Approved business knowledge: ${config.knowledge}`;
     sarvamStt = new WebSocket(`wss://api.sarvam.ai/speech-to-text/ws?${query}`, {
       headers: { "Api-Subscription-Key": sarvamApiKey }
     });
+    armProviderTimeout(sarvamStt, "sarvam_stt");
     sarvamStt.on("open", () => {
       ready = true;
-      for (const audio of bufferedAudio.splice(0)) sendSarvamAudio(audio);
-      console.log("sarvam_stt_connected", { streamSid });
+      for (const audio of bufferedAudio.drain()) sendSarvamAudio(audio);
+      callLog("info", "provider_connected", { targetProvider: "sarvam_stt" });
     });
     sarvamStt.on("message", raw => {
-      const event = JSON.parse(raw.toString());
+      const event = parseFrame(raw, "sarvam_stt");
+      if (!event) return;
       const signal = event.data?.signal_type || event.type;
       if (["START_SPEECH", "speech_start"].includes(signal)) {
-        if (twilio.readyState === WebSocket.OPEN) twilio.send(JSON.stringify({ event: "clear", streamSid }));
+        safeSend(twilio, JSON.stringify({ event: "clear", streamSid }), "twilio");
         sarvamReplyController?.abort();
         interruptExternalVoice();
       }
       const transcript = event.data?.transcript || (event.type === "transcript" ? event.transcript : "");
       if (transcript) generateSarvamReply(transcript);
-      if (event.type === "error") console.error("sarvam_stt_error", event.data?.code, event.data?.message || event);
+      if (event.type === "error") callLog("error", "provider_error", { targetProvider: "sarvam_stt", code: event.data?.code });
     });
-    sarvamStt.on("error", error => console.error("sarvam_stt_socket_error", error.message));
-    sarvamStt.on("close", (code, reason) => console.log("sarvam_stt_closed", { streamSid, code, reason: reason.toString() }));
+    sarvamStt.on("error", error => callLog("error", "provider_socket_error", { targetProvider: "sarvam_stt", message: error.message }));
+    sarvamStt.on("close", (code, reason) => callLog("info", "provider_closed", { targetProvider: "sarvam_stt", code, reason: reason.toString() }));
   }
 
   function sendSarvamAudio(audio) {
     if (sarvamStt?.readyState !== WebSocket.OPEN) return;
-    sarvamStt.send(JSON.stringify({ audio: { data: mulawToPcm16(audio), sample_rate: "8000", encoding: "audio/wav" } }));
+    safeSend(sarvamStt, JSON.stringify({ audio: { data: mulawToPcm16(audio), sample_rate: "8000", encoding: "audio/wav" } }), "sarvam_stt");
   }
 
   async function connectOpenAI(parameters = {}) {
-    const config = await loadContext(parameters.contextId, parameters.scenario);
-    await setupConnectorSession(config);
+    const config = await withDeadline(loadContext(parameters.contextId, parameters.scenario), "context_load_timeout");
+    await withDeadline(setupConnectorSession(config), "connector_setup_timeout");
+    if (closed) return;
     openai = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1", {
       headers: { Authorization: `Bearer ${apiKey}`, origin: "https://api.openai.com" }
     });
+    armProviderTimeout(openai, "openai");
     openai.on("open", () => {
       sendOpenAI({
         type: "session.update",
@@ -462,17 +623,18 @@ Approved business knowledge: ${config.knowledge}`,
         }
       });
       ready = true;
-      for (const audio of bufferedAudio.splice(0)) sendOpenAI({ type: "input_audio_buffer.append", audio });
+      for (const audio of bufferedAudio.drain()) sendOpenAI({ type: "input_audio_buffer.append", audio });
       if (!greetingSent) {
         greetingSent = true;
         sendOpenAI({ type: "response.create", response: { instructions: `Give a brief, warm greeting in a relaxed conversational tone: "Hi, ${config.name} here — how can I help?" Do not sound like an announcement. Use the caller's language if they speak first.` } });
       }
-      console.log("openai_connected", { streamSid });
+      callLog("info", "provider_connected", { targetProvider: "openai" });
     });
     openai.on("message", raw => {
-      const event = JSON.parse(raw.toString());
+      const event = parseFrame(raw, "openai");
+      if (!event) return;
       if ((event.type === "response.output_audio.delta" || event.type === "response.audio.delta") && event.delta && twilio.readyState === WebSocket.OPEN) {
-        twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.delta } }));
+        safeSend(twilio, JSON.stringify({ event: "media", streamSid, media: { payload: event.delta } }), "twilio");
       }
       if (selectedVoiceProvider === "cartesia" && (event.type === "response.output_text.delta" || event.type === "response.text.delta") && event.delta) {
         streamTextToCartesia(event.delta);
@@ -487,7 +649,7 @@ Approved business knowledge: ${config.knowledge}`,
         streamTextToSarvam("", true);
       }
       if (event.type === "input_audio_buffer.speech_started" && twilio.readyState === WebSocket.OPEN) {
-        twilio.send(JSON.stringify({ event: "clear", streamSid }));
+        safeSend(twilio, JSON.stringify({ event: "clear", streamSid }), "twilio");
         interruptExternalVoice();
       }
       if (event.type === "response.done") {
@@ -502,37 +664,138 @@ Approved business knowledge: ${config.knowledge}`,
           });
         }
       }
-      if (event.type === "error") console.error("openai_error", event.error?.code, event.error?.message);
+      if (event.type === "error") callLog("error", "provider_error", { targetProvider: "openai", code: event.error?.code, message: event.error?.message });
     });
-    openai.on("close", (code, reason) => console.log("openai_closed", { streamSid, code, reason: reason.toString() }));
-    openai.on("error", error => console.error("openai_socket_error", error.message));
+    openai.on("close", (code, reason) => callLog("info", "provider_closed", { targetProvider: "openai", code, reason: reason.toString() }));
+    openai.on("error", error => callLog("error", "provider_socket_error", { targetProvider: "openai", message: error.message }));
   }
 
   twilio.on("message", raw => {
-    const event = JSON.parse(raw.toString());
-    if (event.event === "start") {
+    const event = parseFrame(raw, "twilio");
+    if (!event) return;
+
+    if (!authenticated) {
+      if (event.event === "connected" && event.protocol === "Call" && event.version === "1.0.0") return;
+      if (event.event !== "start" || !event.start || typeof event.start !== "object") return failCall("expected_authenticated_start", 1008);
+      const parameters = event.start.customParameters || {};
+      if (!tokenPayload) {
+        try { tokenPayload = verifyMediaToken(parameters.mediaToken, mediaStreamSecret); }
+        catch (error) {
+          callLog("warn", "media_auth_rejected", { reason: error.message });
+          return failCall("invalid_media_token", 1008);
+        }
+      }
+      try {
+        if (!/^MZ[a-f0-9]{32}$/i.test(String(event.start.streamSid || ""))) throw new Error("invalid_stream_sid");
+        if (!/^CA[a-f0-9]{32}$/i.test(String(event.start.callSid || ""))) throw new Error("invalid_call_sid");
+        if (parameters.scenario && !(parameters.scenario in scenarios)) throw new Error("invalid_scenario");
+        if (parameters.voiceProvider && !["openai", "sarvam", "cartesia"].includes(parameters.voiceProvider)) throw new Error("invalid_voice_provider");
+        if (parameters.contextId && !/^[a-f0-9-]{20,64}$/i.test(parameters.contextId)) throw new Error("invalid_context_id");
+        assertMediaTokenBinding(tokenPayload, event.start);
+        pruneTokenIds();
+        if (usedTokenIds.has(tokenPayload.jti)) throw new Error("replayed_token");
+        usedTokenIds.set(tokenPayload.jti, tokenPayload.exp);
+      } catch (error) {
+        callLog("warn", "media_auth_rejected", { reason: error.message });
+        return failCall("invalid_start_parameters", 1008);
+      }
+
+      clearTimeout(startTimer);
       streamSid = event.start.streamSid;
-      const requestedProvider = event.start.customParameters?.voiceProvider;
+      callSid = event.start.callSid;
+      authenticated = true;
+      pendingAdmission = false;
+      pendingMediaConnections = Math.max(0, pendingMediaConnections - 1);
+      const requestedProvider = parameters.voiceProvider;
       if (["openai", "sarvam", "cartesia"].includes(requestedProvider)) selectedVoiceProvider = requestedProvider;
+      if (["openai", "cartesia"].includes(selectedVoiceProvider) && !apiKey) return failCall("openai_not_configured", 1013);
+      if (selectedVoiceProvider === "cartesia" && !cartesiaApiKey) return failCall("cartesia_not_configured", 1013);
+      if (selectedVoiceProvider === "sarvam" && !sarvamApiKey) return failCall("sarvam_not_configured", 1013);
+      callLog("info", "call_admitted", { hasContext: Boolean(parameters.contextId) });
       connectCartesia();
       if (selectedVoiceProvider === "sarvam") {
-        connectSarvamFullStack(event.start.customParameters || {}).catch(error => console.error("sarvam_connect_failed", error.message));
+        connectSarvamFullStack(parameters).catch(error => {
+          callLog("error", "provider_connect_failed", { targetProvider: "sarvam", message: error.message });
+          failCall("provider_connect_failed", 1013);
+        });
       } else {
-        connectOpenAI(event.start.customParameters || {}).catch(error => console.error("openai_connect_failed", error.message));
+        connectOpenAI(parameters).catch(error => {
+          callLog("error", "provider_connect_failed", { targetProvider: "openai", message: error.message });
+          failCall("provider_connect_failed", 1013);
+        });
       }
-    } else if (event.event === "media" && event.media?.payload) {
-      if (ready && selectedVoiceProvider === "sarvam") sendSarvamAudio(event.media.payload);
-      else if (ready) sendOpenAI({ type: "input_audio_buffer.append", audio: event.media.payload });
-      else bufferedAudio.push(event.media.payload);
+      return;
+    }
+
+    if (event.event === "start") return failCall("duplicate_start", 1008);
+    if (event.event === "media" && event.media?.payload) {
+      const audio = event.media.payload;
+      if (typeof audio !== "string" || audio.length > maxFrameBytes || !/^[A-Za-z0-9+/]*={0,2}$/.test(audio)) return failCall("invalid_audio_payload", 1007);
+      if (ready && selectedVoiceProvider === "sarvam") sendSarvamAudio(audio);
+      else if (ready) sendOpenAI({ type: "input_audio_buffer.append", audio });
+      else queueOrFail(bufferedAudio, audio, "startup_audio");
     } else if (event.event === "stop") {
-      openai?.close(1000, "Twilio stream ended");
-      cartesia?.close(1000, "Twilio stream ended");
-      sarvam?.close(1000, "Twilio stream ended");
-      sarvamStt?.close(1000, "Twilio stream ended");
+      closeSocket(openai, 1000, "Twilio stream ended");
+      closeSocket(cartesia, 1000, "Twilio stream ended");
+      closeSocket(sarvam, 1000, "Twilio stream ended");
+      closeSocket(sarvamStt, 1000, "Twilio stream ended");
     }
   });
-  twilio.on("close", () => { sarvamReplyController?.abort(); openai?.close(1000, "Caller disconnected"); cartesia?.close(1000, "Caller disconnected"); sarvam?.close(1000, "Caller disconnected"); sarvamStt?.close(1000, "Caller disconnected"); });
-  twilio.on("error", error => console.error("twilio_socket_error", error.message));
+  twilio.on("close", (code, reason) => {
+    if (closed) return;
+    closed = true;
+    activeCalls = Math.max(0, activeCalls - 1);
+    if (pendingAdmission) pendingMediaConnections = Math.max(0, pendingMediaConnections - 1);
+    clearTimeout(startTimer);
+    clearProviderTimers();
+    bufferedAudio.clear();
+    cartesiaQueue.clear();
+    sarvamQueue.clear();
+    sarvamReplyController?.abort();
+    closeSocket(openai, 1000, "Caller disconnected");
+    closeSocket(cartesia, 1000, "Caller disconnected");
+    closeSocket(sarvam, 1000, "Caller disconnected");
+    closeSocket(sarvamStt, 1000, "Caller disconnected");
+    callLog("info", "call_closed", { code, reason: reason.toString(), activeCalls });
+  });
+  twilio.on("error", error => callLog("error", "twilio_socket_error", { message: error.message }));
 });
 
-server.listen(port, "0.0.0.0", () => console.log(`HalaCX voice worker listening on ${port}`));
+server.listen(port, "0.0.0.0", () => log("info", "worker_started", { port, capacity: maxActiveCalls }));
+
+function beginDrain(signal) {
+  if (draining) return;
+  draining = true;
+  let shutdownStarted = false;
+  const finish = code => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    void closeDatabase().finally(() => process.exit(code));
+  };
+  log("info", "worker_draining", { signal, activeCalls });
+  server.close(error => {
+    if (error) log("error", "http_close_failed", { message: error.message });
+    if (activeCalls === 0) finish(error ? 1 : 0);
+  });
+  const deadline = positiveIntegerEnv("DRAIN_TIMEOUT_MS", 30_000, 5_000);
+  const timer = setTimeout(() => {
+    log("warn", "worker_drain_deadline", { activeCalls });
+    for (const client of twilioServer.clients) closeSocket(client, 1012, "Worker restarting");
+    finish(0);
+  }, deadline);
+  timer.unref();
+  const poll = setInterval(() => {
+    if (activeCalls !== 0) return;
+    clearInterval(poll);
+    clearTimeout(timer);
+    finish(0);
+  }, 100);
+  poll.unref();
+}
+
+async function closeDatabase() {
+  if (pool) await pool.end();
+}
+
+process.on("SIGTERM", () => beginDrain("SIGTERM"));
+process.on("SIGINT", () => beginDrain("SIGINT"));

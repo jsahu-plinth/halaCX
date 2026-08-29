@@ -18,15 +18,34 @@ export function contextInstructions(context: string) {
   return contexts[normalizeContext(context)];
 }
 
-export async function createPendingCallContext(value: string, workspaceId?: string) {
+export async function createPendingCallContext(value: string, workspaceId?: string, callId?: string) {
   const context = normalizeContext(value);
   if (!isDatabaseConfigured) return { id: null, context };
-  const result = await query<{ id: string }>("insert into pending_call_contexts(workspace_id,context) values($1,$2) returning id", [workspaceId || null, context]);
+  const result = await query<{ id: string }>(
+    "insert into pending_call_contexts(workspace_id,call_id,context,expires_at) values($1,$2,$3,now()+interval '15 minutes') returning id",
+    [workspaceId || null, callId || null, context],
+  );
   return { id: result.rows[0].id, context };
 }
 
-export async function attachProviderCall(contextId: string | null, providerCallId: string) {
-  if (contextId && isDatabaseConfigured) await query("update pending_call_contexts set provider_call_id=$1 where id=$2", [providerCallId, contextId]);
+export async function attachProviderCall(contextId: string | null, providerCallId: string, callId?: string) {
+  if (!isDatabaseConfigured) return;
+  await withTransaction(async (client) => {
+    let boundCallId = callId || null;
+    if (contextId) {
+      const pending = await client.query<{ call_id: string | null }>(
+        "update pending_call_contexts set provider_call_id=$1 where id=$2 returning call_id",
+        [providerCallId, contextId],
+      );
+      boundCallId ||= pending.rows[0]?.call_id || null;
+    }
+    if (boundCallId) {
+      await client.query(
+        "update calls set provider_call_id=$1 where id=$2 and (provider_call_id is null or provider_call_id=$1)",
+        [providerCallId, boundCallId],
+      );
+    }
+  });
 }
 
 export async function discardPendingCall(contextId: string | null) {
@@ -34,16 +53,16 @@ export async function discardPendingCall(contextId: string | null) {
 }
 
 export async function consumePendingCallContext(contextId?: string | null) {
-  if (!isDatabaseConfigured) return { context: "receptionist" as ContextKey, workspaceId: null, providerCallId: null };
-  if (!contextId) return { context: "receptionist" as ContextKey, workspaceId: null, providerCallId: null };
+  if (!isDatabaseConfigured) return { context: "receptionist" as ContextKey, workspaceId: null, providerCallId: null, callId: null };
+  if (!contextId) return { context: "receptionist" as ContextKey, workspaceId: null, providerCallId: null, callId: null };
   return withTransaction(async (client) => {
     await client.query("delete from pending_call_contexts where expires_at <= now()");
-    const result = await client.query<{ context: ContextKey; workspace_id: string | null; provider_call_id: string | null }>(
-      "delete from pending_call_contexts where id=(select id from pending_call_contexts where id=$1 and expires_at>now() for update skip locked) returning context,workspace_id,provider_call_id",
+    const result = await client.query<{ context: ContextKey; workspace_id: string | null; provider_call_id: string | null; call_id: string | null }>(
+      "select context,workspace_id,provider_call_id,call_id from pending_call_contexts where id=$1 and expires_at>now() for update",
       [contextId],
     );
     const row = result.rows[0];
-    return { context: normalizeContext(row?.context || "receptionist"), workspaceId: row?.workspace_id || null, providerCallId: row?.provider_call_id || null };
+    return { context: normalizeContext(row?.context || "receptionist"), workspaceId: row?.workspace_id || null, providerCallId: row?.provider_call_id || null, callId: row?.call_id || null };
   });
 }
 

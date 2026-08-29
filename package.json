@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test": "node --no-warnings --experimental-strip-types --test tests/*.test.mjs",
     "lint": "eslint .",
     "db:migrate": "node --env-file=.env.local scripts/migrate.mjs",
     "backend:verify": "node --env-file=.env.local scripts/verify-backend.mjs"

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { readSession } from "@/lib/auth";
 import { isDatabaseConfigured, query } from "@/lib/db";
 import { allowDemoCall, attachProviderCall, createPendingCallContext, discardPendingCall } from "@/lib/call-context";
+import { createMediaStreamToken } from "@/lib/media-token";
 
 const schema = z.object({
   phone: z.string()
@@ -32,13 +33,33 @@ export async function POST(request: Request) {
   const username = apiKeySid || sid;
   const password = apiKeySecret || authToken;
 
-  if (!sid || !username || !password || !from || !appUrl || !voiceUrl) {
+  if (!sid || !username || !password || !from || !appUrl || !voiceUrl || !process.env.MEDIA_STREAM_SECRET) {
     return NextResponse.json({ error: "Voice providers are not fully configured." }, { status: 503 });
   }
 
-  const pending = await createPendingCallContext(parsed.data.context, session && !session.preview ? session.workspaceId : undefined);
+  let internalCallId: string | null = null;
+  if (isDatabaseConfigured && session && !session.preview) {
+    const internalCall = await query<{ id: string }>(
+      "insert into calls(workspace_id,agent_id,direction,from_number,to_number,status,started_at,outcome) values($1,(select id from agents where workspace_id=$1 order by created_at limit 1),'outbound',$2,$3,'queued',now(),$4) returning id",
+      [session.workspaceId, from, parsed.data.phone, `Scenario: ${parsed.data.context}`],
+    );
+    internalCallId = internalCall.rows[0].id;
+  }
+
+  const pending = await createPendingCallContext(
+    parsed.data.context,
+    session && !session.preview ? session.workspaceId : undefined,
+    internalCallId || undefined,
+  );
+  const mediaToken = createMediaStreamToken({
+    contextId: pending.id || undefined,
+    internalCallId: internalCallId || undefined,
+    scenario: pending.context,
+    voiceProvider: parsed.data.voiceProvider,
+  });
   const contextParameter = pending.id ? `<Parameter name="contextId" value="${pending.id}"/>` : "";
-  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}<Parameter name="scenario" value="${pending.context}"/><Parameter name="voiceProvider" value="${parsed.data.voiceProvider}"/></Stream></Connect></Response>`;
+  const internalCallParameter = internalCallId ? `<Parameter name="internalCallId" value="${internalCallId}"/>` : "";
+  const twiml = `<Response><Connect><Stream url="${voiceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">${contextParameter}${internalCallParameter}<Parameter name="scenario" value="${pending.context}"/><Parameter name="voiceProvider" value="${parsed.data.voiceProvider}"/><Parameter name="mediaToken" value="${mediaToken}"/></Stream></Connect></Response>`;
   const body = new URLSearchParams({
     To: parsed.data.phone,
     From: from,
@@ -59,14 +80,18 @@ export async function POST(request: Request) {
   const data = await response.json();
   if (!response.ok) {
     await discardPendingCall(pending.id);
+    if (internalCallId) {
+      await query(
+        "update calls set status='failed',ended_at=now(),summary=$1 where id=$2",
+        [String(data.message || "Twilio could not start the call."), internalCallId],
+      );
+      await query(
+        "insert into call_events(call_id,event_type,payload) values($1,'carrier.create_failed',$2::jsonb)",
+        [internalCallId, JSON.stringify({ message: String(data.message || "Twilio could not start the call.") })],
+      );
+    }
     return NextResponse.json({ error: data.message ?? "Twilio could not start the call." }, { status: 502 });
   }
-  await attachProviderCall(pending.id, data.sid);
-  if (isDatabaseConfigured && session && !session.preview) {
-    await query(
-      "insert into calls(workspace_id,agent_id,provider_call_id,direction,from_number,to_number,status,started_at,outcome) values($1,(select id from agents where workspace_id=$1 order by created_at limit 1),$2,'outbound',$3,$4,'queued',now(),$5) on conflict(provider_call_id) do nothing",
-      [session.workspaceId, data.sid, from, parsed.data.phone, `Scenario: ${pending.context}`],
-    );
-  }
+  await attachProviderCall(pending.id, data.sid, internalCallId || undefined);
   return NextResponse.json({ callId: data.sid, demo: false, persisted: Boolean(session && !session.preview) });
 }
