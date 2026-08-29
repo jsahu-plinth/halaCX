@@ -14,7 +14,10 @@
     "@composio/core": "^0.18.0",
     "@phosphor-icons/react": "^2.1.10",
     "@radix-ui/themes": "^3.3.0",
+    "@untitledui/icons": "^0.0.22",
     "bcryptjs": "^3.0.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "gsap": "^3.15.0",
     "jose": "^6.2.10",
     "lucide-react": "^1.37.0",
@@ -22,6 +25,7 @@
     "openai": "^7.8.0",
     "pg": "^8.23.0",
     "react": "^19.2.4",
+    "react-aria-components": "^1.20.0",
     "react-dom": "^19.2.4",
     "ws": "^8.21.3",
     "zod": "^4.5.1"
