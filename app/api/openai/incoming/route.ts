@@ -4,7 +4,7 @@ import WebSocket from "ws";
 import { consumePendingCallContext, contextInstructions } from "@/lib/call-context";
 import { isDatabaseConfigured, query } from "@/lib/db";
 
-export const maxDuration = 30;
+export const maxDuration = 300;
 
 async function startGreeting(callId: string, agentName: string) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -12,14 +12,19 @@ async function startGreeting(callId: string, agentName: string) {
 
   await new Promise<void>((resolve, reject) => {
     const socket = new WebSocket(`wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        origin: "https://api.openai.com",
+      },
     });
-    const timeout = setTimeout(() => {
+    const connectionTimeout = setTimeout(() => {
       socket.terminate();
       reject(new Error("Realtime greeting connection timed out"));
     }, 15_000);
+    const callTimeout = setTimeout(() => socket.close(1000, "Call worker time limit"), 280_000);
 
     socket.once("open", () => {
+      clearTimeout(connectionTimeout);
       socket.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -30,21 +35,23 @@ async function startGreeting(callId: string, agentName: string) {
     socket.on("message", (raw) => {
       try {
         const event = JSON.parse(raw.toString()) as { type?: string; error?: { message?: string } };
-        if (event.type === "error") throw new Error(event.error?.message || "Realtime greeting failed");
-        if (event.type === "response.done") {
-          clearTimeout(timeout);
-          socket.close();
-          resolve();
-        }
+        if (event.type === "error") throw new Error(event.error?.message || "Realtime call failed");
       } catch (error) {
-        clearTimeout(timeout);
+        clearTimeout(connectionTimeout);
+        clearTimeout(callTimeout);
         socket.terminate();
         reject(error);
       }
     });
     socket.once("error", (error) => {
-      clearTimeout(timeout);
+      clearTimeout(connectionTimeout);
+      clearTimeout(callTimeout);
       reject(error);
+    });
+    socket.once("close", () => {
+      clearTimeout(connectionTimeout);
+      clearTimeout(callTimeout);
+      resolve();
     });
   });
 }
@@ -111,5 +118,8 @@ export async function POST(request: Request) {
       console.error("OpenAI greeting failed", error);
     }
   });
-  return NextResponse.json({ ok: true });
+  return NextResponse.json(
+    { ok: true },
+    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } },
+  );
 }
