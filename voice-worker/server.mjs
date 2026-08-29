@@ -1,14 +1,19 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import pg from "pg";
 import WebSocket, { WebSocketServer } from "ws";
 
 const { Pool } = pg;
 const port = Number(process.env.PORT || 8080);
 const apiKey = process.env.OPENAI_API_KEY;
+const voiceProvider = process.env.VOICE_PROVIDER || "openai";
+const cartesiaApiKey = process.env.CARTESIA_API_KEY;
+const cartesiaVoiceId = process.env.CARTESIA_VOICE_ID || "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4";
 const databaseUrl = process.env.DATABASE_URL;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, ssl: { rejectUnauthorized: false } }) : null;
 
 if (!apiKey) throw new Error("OPENAI_API_KEY is required");
+if (voiceProvider === "cartesia" && !cartesiaApiKey) throw new Error("CARTESIA_API_KEY is required when VOICE_PROVIDER=cartesia");
 
 const scenarios = {
   receptionist: "Act as a front-desk receptionist. Answer questions, capture the caller's name and message, and offer a human follow-up when needed.",
@@ -70,12 +75,56 @@ server.on("upgrade", (request, socket, head) => {
 twilioServer.on("connection", twilio => {
   let streamSid = "";
   let openai = null;
+  let cartesia = null;
   let ready = false;
   let greetingSent = false;
+  let cartesiaContextId = "";
   const bufferedAudio = [];
+  const cartesiaQueue = [];
 
   function sendOpenAI(payload) {
     if (openai?.readyState === WebSocket.OPEN) openai.send(JSON.stringify(payload));
+  }
+
+  function sendCartesia(payload) {
+    const message = JSON.stringify(payload);
+    if (cartesia?.readyState === WebSocket.OPEN) cartesia.send(message);
+    else cartesiaQueue.push(message);
+  }
+
+  function connectCartesia() {
+    if (voiceProvider !== "cartesia") return;
+    cartesia = new WebSocket("wss://api.cartesia.ai/tts/websocket?cartesia_version=2026-03-01", {
+      headers: { Authorization: `Bearer ${cartesiaApiKey}` }
+    });
+    cartesia.on("open", () => {
+      for (const message of cartesiaQueue.splice(0)) cartesia.send(message);
+      console.log("cartesia_connected", { streamSid });
+    });
+    cartesia.on("message", raw => {
+      const event = JSON.parse(raw.toString());
+      if (event.type === "chunk" && event.data && twilio.readyState === WebSocket.OPEN) {
+        twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.data } }));
+      }
+      if (event.type === "error") console.error("cartesia_error", event.error || event.message || event);
+    });
+    cartesia.on("error", error => console.error("cartesia_socket_error", error.message));
+    cartesia.on("close", (code, reason) => console.log("cartesia_closed", { streamSid, code, reason: reason.toString() }));
+  }
+
+  function streamTextToCartesia(text, isFinal = false) {
+    if (!cartesiaContextId) cartesiaContextId = randomUUID();
+    sendCartesia({
+      model_id: "sonic-3.5",
+      transcript: text,
+      voice: { mode: "id", id: cartesiaVoiceId },
+      language: "en",
+      context_id: cartesiaContextId,
+      output_format: { container: "raw", encoding: "pcm_mulaw", sample_rate: 8000 },
+      continue: !isFinal,
+      max_buffer_delay_ms: 350
+    });
+    if (isFinal) cartesiaContextId = "";
   }
 
   async function connectOpenAI(parameters = {}) {
@@ -106,10 +155,10 @@ Conversation rules:
 - Match the caller's language and level of formality.
 
 Approved business knowledge: ${config.knowledge}`,
-          output_modalities: ["audio"],
+          output_modalities: [voiceProvider === "cartesia" ? "text" : "audio"],
           audio: {
             input: { format: { type: "audio/pcmu" }, turn_detection: { type: "server_vad", create_response: true, interrupt_response: true } },
-            output: { format: { type: "audio/pcmu" }, voice: config.voice || "marin" }
+            ...(voiceProvider === "openai" ? { output: { format: { type: "audio/pcmu" }, voice: config.voice || "coral" } } : {})
           }
         }
       });
@@ -126,8 +175,16 @@ Approved business knowledge: ${config.knowledge}`,
       if ((event.type === "response.output_audio.delta" || event.type === "response.audio.delta") && event.delta && twilio.readyState === WebSocket.OPEN) {
         twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: event.delta } }));
       }
+      if (voiceProvider === "cartesia" && (event.type === "response.output_text.delta" || event.type === "response.text.delta") && event.delta) {
+        streamTextToCartesia(event.delta);
+      }
+      if (voiceProvider === "cartesia" && (event.type === "response.output_text.done" || event.type === "response.text.done")) {
+        streamTextToCartesia("", true);
+      }
       if (event.type === "input_audio_buffer.speech_started" && twilio.readyState === WebSocket.OPEN) {
         twilio.send(JSON.stringify({ event: "clear", streamSid }));
+        if (cartesiaContextId) sendCartesia({ context_id: cartesiaContextId, cancel: true });
+        cartesiaContextId = "";
       }
       if (event.type === "error") console.error("openai_error", event.error?.code, event.error?.message);
     });
@@ -139,15 +196,17 @@ Approved business knowledge: ${config.knowledge}`,
     const event = JSON.parse(raw.toString());
     if (event.event === "start") {
       streamSid = event.start.streamSid;
+      connectCartesia();
       connectOpenAI(event.start.customParameters || {}).catch(error => console.error("openai_connect_failed", error.message));
     } else if (event.event === "media" && event.media?.payload) {
       if (ready) sendOpenAI({ type: "input_audio_buffer.append", audio: event.media.payload });
       else bufferedAudio.push(event.media.payload);
     } else if (event.event === "stop") {
       openai?.close(1000, "Twilio stream ended");
+      cartesia?.close(1000, "Twilio stream ended");
     }
   });
-  twilio.on("close", () => openai?.close(1000, "Caller disconnected"));
+  twilio.on("close", () => { openai?.close(1000, "Caller disconnected"); cartesia?.close(1000, "Caller disconnected"); });
   twilio.on("error", error => console.error("twilio_socket_error", error.message));
 });
 
