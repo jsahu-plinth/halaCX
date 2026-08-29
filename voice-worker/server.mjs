@@ -22,7 +22,7 @@ async function loadContext(contextId, fallbackScenario) {
     name: "Maya",
     voice: "marin",
     scenario: fallbackScenario in scenarios ? fallbackScenario : "receptionist",
-    instructions: "Be warm, concise, multilingual, and never invent business facts.",
+    instructions: "Be warm, natural, multilingual, and never invent business facts.",
     knowledge: process.env.RECEPTIONIST_KNOWLEDGE || "No approved business knowledge is available. Collect a message instead of guessing."
   };
   if (!pool || !contextId) return base;
@@ -89,7 +89,19 @@ twilioServer.on("connection", twilio => {
         session: {
           type: "realtime",
           model: "gpt-realtime-2.1",
-          instructions: `You are ${config.name}, a HalaCX voice receptionist. ${config.instructions} ${scenarios[config.scenario]} Approved business knowledge: ${config.knowledge}`,
+          instructions: `You are ${config.name}, a natural human-sounding HalaCX receptionist. ${config.instructions} ${scenarios[config.scenario]}
+
+Conversation rules:
+- Keep most replies to one short sentence. Use two only when necessary.
+- Do not repeat, paraphrase, or summarize what the caller just said.
+- When taking notes, capture details silently. Say only a brief acknowledgement such as "Got it" and ask the next necessary question.
+- Ask one question at a time. Do not explain your process or announce what you are recording.
+- Avoid filler, lists, speeches, excessive politeness, and phrases like "Just to confirm" after every detail.
+- Only recap details when the caller asks, when correcting ambiguity, or once at the end before an important action.
+- If the caller gives several details together, retain all of them and continue without requesting them again.
+- Match the caller's language and level of formality.
+
+Approved business knowledge: ${config.knowledge}`,
           output_modalities: ["audio"],
           audio: {
             input: { format: { type: "audio/pcmu" }, turn_detection: { type: "server_vad", create_response: true, interrupt_response: true } },
@@ -101,7 +113,7 @@ twilioServer.on("connection", twilio => {
       for (const audio of bufferedAudio.splice(0)) sendOpenAI({ type: "input_audio_buffer.append", audio });
       if (!greetingSent) {
         greetingSent = true;
-        sendOpenAI({ type: "response.create", response: { instructions: `Introduce yourself as ${config.name} from HalaCX, welcome the caller, and ask how you can help. Keep it brief.` } });
+        sendOpenAI({ type: "response.create", response: { instructions: `Say only: "Hi, this is ${config.name}. How can I help?" Use the caller's language if they speak first.` } });
       }
       console.log("openai_connected", { streamSid });
     });
