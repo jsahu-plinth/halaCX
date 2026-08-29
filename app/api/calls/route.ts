@@ -36,7 +36,15 @@ export async function POST(request: Request) {
   const pending = await createPendingCallContext(parsed.data.context, session && !session.preview ? session.workspaceId : undefined);
   const sipContextHeader = pending.id ? `?x-halacx-context=${encodeURIComponent(pending.id)}` : "";
   const twiml = `<Response><Dial record="record-from-answer-dual" recordingStatusCallback="${appUrl}/api/twilio/recording"><Sip>sip:${projectId}@sip.api.openai.com;transport=tls${sipContextHeader}</Sip></Dial></Response>`;
-  const body = new URLSearchParams({ To: parsed.data.phone, From: from, Twiml: twiml, StatusCallback: `${appUrl}/api/twilio/status`, StatusCallbackEvent: "initiated ringing answered completed" });
+  const body = new URLSearchParams({
+    To: parsed.data.phone,
+    From: from,
+    Twiml: twiml,
+    StatusCallback: `${appUrl}/api/twilio/status`,
+  });
+  for (const event of ["initiated", "ringing", "answered", "completed"]) {
+    body.append("StatusCallbackEvent", event);
+  }
   const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Calls.json`, {
     method: "POST",
     headers: { Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`, "Content-Type": "application/x-www-form-urlencoded" },
