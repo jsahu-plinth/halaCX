@@ -25,6 +25,7 @@ async function startGreeting(callId: string, agentName: string) {
 
     socket.once("open", () => {
       clearTimeout(connectionTimeout);
+      console.info("OpenAI Realtime sideband opened", { callId });
       socket.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -35,6 +36,9 @@ async function startGreeting(callId: string, agentName: string) {
     socket.on("message", (raw) => {
       try {
         const event = JSON.parse(raw.toString()) as { type?: string; error?: { message?: string } };
+        if (["session.created", "response.created", "response.done"].includes(event.type || "")) {
+          console.info("OpenAI Realtime event", { callId, type: event.type });
+        }
         if (event.type === "error") throw new Error(event.error?.message || "Realtime call failed");
       } catch (error) {
         clearTimeout(connectionTimeout);
@@ -51,6 +55,7 @@ async function startGreeting(callId: string, agentName: string) {
     socket.once("close", () => {
       clearTimeout(connectionTimeout);
       clearTimeout(callTimeout);
+      console.info("OpenAI Realtime sideband closed", { callId });
       resolve();
     });
   });
@@ -110,6 +115,10 @@ export async function POST(request: Request) {
     console.error("OpenAI call acceptance failed", response.status, detail.slice(0, 1_000));
     return NextResponse.json({ ok: false }, { status: 502 });
   }
+  console.info("OpenAI SIP call accepted", {
+    callId,
+    requestId: response.headers.get("x-request-id") || "",
+  });
 
   after(async () => {
     try {
