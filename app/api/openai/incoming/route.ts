@@ -94,7 +94,7 @@ export async function POST(request: Request) {
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       type: "realtime",
-      model: "gpt-realtime",
+      model: "gpt-realtime-2.1",
       instructions: `You are ${agent.name}, a warm, concise multilingual contact-center agent powered by HalaCX. Start by introducing yourself and asking whether now is a good time. Match the caller's language when possible. Never invent business facts. ${agent.instructions} ${scenario} Ask for the caller's name and preferred follow-up when appropriate. Approved business knowledge: ${knowledge}`,
     }),
   });
