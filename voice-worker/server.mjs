@@ -12,6 +12,8 @@ const cartesiaVoiceId = process.env.CARTESIA_VOICE_ID || "db6b0ed5-d5d3-463d-ae8
 const sarvamApiKey = process.env.SARVAM_API_KEY;
 const sarvamSpeaker = process.env.SARVAM_SPEAKER || "priya";
 const sarvamLanguage = process.env.SARVAM_LANGUAGE || "en-IN";
+const sarvamSttModel = process.env.SARVAM_STT_MODEL || "saaras:v3";
+const sarvamChatModel = process.env.SARVAM_CHAT_MODEL || "sarvam-105b-conversations";
 const databaseUrl = process.env.DATABASE_URL;
 const pool = databaseUrl ? new Pool({ connectionString: databaseUrl, max: 3, ssl: { rejectUnauthorized: false } }) : null;
 
@@ -25,6 +27,21 @@ const scenarios = {
   lead: "Act as a helpful lead qualification agent. Ask about the caller's company, need, urgency, and preferred next step.",
   support: "Act as a customer-support agent. Ask for the issue and reference number, explain the next action, and escalate when human judgment is needed."
 };
+
+function mulawToPcm16(base64) {
+  const input = Buffer.from(base64, "base64");
+  const output = Buffer.allocUnsafe(input.length * 2);
+  for (let index = 0; index < input.length; index += 1) {
+    const value = ~input[index] & 0xff;
+    const sign = value & 0x80;
+    const exponent = (value >> 4) & 0x07;
+    const mantissa = value & 0x0f;
+    let sample = ((mantissa << 3) + 0x84) << exponent;
+    sample = sign ? 0x84 - sample : sample - 0x84;
+    output.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), index * 2);
+  }
+  return output.toString("base64");
+}
 
 async function loadContext(contextId, fallbackScenario) {
   const base = {
@@ -82,6 +99,7 @@ twilioServer.on("connection", twilio => {
   let openai = null;
   let cartesia = null;
   let sarvam = null;
+  let sarvamStt = null;
   let ready = false;
   let greetingSent = false;
   let cartesiaContextId = "";
@@ -90,6 +108,9 @@ twilioServer.on("connection", twilio => {
   const sarvamQueue = [];
   let sarvamGeneration = 0;
   let sarvamTextBuffer = "";
+  let sarvamReplyController = null;
+  let sarvamMessages = [];
+  let sarvamSystemPrompt = "";
 
   function sendOpenAI(payload) {
     if (openai?.readyState === WebSocket.OPEN) openai.send(JSON.stringify(payload));
@@ -209,6 +230,109 @@ twilioServer.on("connection", twilio => {
     }
   }
 
+  async function generateSarvamReply(userText) {
+    const cleanText = userText?.trim();
+    if (!cleanText) return;
+    sarvamReplyController?.abort();
+    sarvamReplyController = new AbortController();
+    sarvamMessages.push({ role: "user", content: cleanText });
+    sarvamMessages = sarvamMessages.slice(-12);
+    let assistantText = "";
+    try {
+      const response = await fetch("https://api.sarvam.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "api-subscription-key": sarvamApiKey, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: sarvamChatModel,
+          messages: [{ role: "system", content: sarvamSystemPrompt }, ...sarvamMessages],
+          stream: true,
+          reasoning_effort: null,
+          temperature: 0.35,
+          max_tokens: 120
+        }),
+        signal: sarvamReplyController.signal
+      });
+      if (!response.ok || !response.body) throw new Error(`Sarvam chat failed (${response.status}): ${await response.text()}`);
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of response.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (!payload || payload === "[DONE]") continue;
+          const event = JSON.parse(payload);
+          const text = event.choices?.[0]?.delta?.content;
+          if (text) {
+            assistantText += text;
+            streamTextToSarvam(text);
+          }
+        }
+      }
+      streamTextToSarvam("", true);
+      if (assistantText.trim()) sarvamMessages.push({ role: "assistant", content: assistantText.trim() });
+      sarvamMessages = sarvamMessages.slice(-12);
+    } catch (error) {
+      if (error.name !== "AbortError") console.error("sarvam_chat_error", error.message);
+    }
+  }
+
+  async function connectSarvamFullStack(parameters = {}) {
+    const config = await loadContext(parameters.contextId, parameters.scenario);
+    sarvamSystemPrompt = `You are ${config.name}, a warm, concise HalaCX receptionist. ${config.instructions} ${scenarios[config.scenario]}
+
+Conversation rules:
+- Match the caller's language, including Hindi-English code-mixing.
+- Speak naturally and keep most replies to one short sentence.
+- Never repeat or paraphrase what the caller just said.
+- When taking notes, say only a brief acknowledgement and ask the next necessary question.
+- Ask one question at a time. Never explain your process.
+- Never invent business facts. Offer a human follow-up when the knowledge does not answer the caller.
+
+Approved business knowledge: ${config.knowledge}`;
+    connectSarvam();
+    streamTextToSarvam(`Hi, ${config.name} here. How can I help?`, true);
+
+    const query = new URLSearchParams({
+      "language-code": "unknown",
+      model: sarvamSttModel,
+      mode: "codemix",
+      sample_rate: "8000",
+      high_vad_sensitivity: "true",
+      vad_signals: "true",
+      input_audio_codec: "pcm_s16le"
+    });
+    sarvamStt = new WebSocket(`wss://api.sarvam.ai/speech-to-text/ws?${query}`, {
+      headers: { "Api-Subscription-Key": sarvamApiKey }
+    });
+    sarvamStt.on("open", () => {
+      ready = true;
+      for (const audio of bufferedAudio.splice(0)) sendSarvamAudio(audio);
+      console.log("sarvam_stt_connected", { streamSid });
+    });
+    sarvamStt.on("message", raw => {
+      const event = JSON.parse(raw.toString());
+      const signal = event.data?.signal_type || event.type;
+      if (["START_SPEECH", "speech_start"].includes(signal)) {
+        if (twilio.readyState === WebSocket.OPEN) twilio.send(JSON.stringify({ event: "clear", streamSid }));
+        sarvamReplyController?.abort();
+        interruptExternalVoice();
+      }
+      const transcript = event.data?.transcript || (event.type === "transcript" ? event.transcript : "");
+      if (transcript) generateSarvamReply(transcript);
+      if (event.type === "error") console.error("sarvam_stt_error", event.data?.code, event.data?.message || event);
+    });
+    sarvamStt.on("error", error => console.error("sarvam_stt_socket_error", error.message));
+    sarvamStt.on("close", (code, reason) => console.log("sarvam_stt_closed", { streamSid, code, reason: reason.toString() }));
+  }
+
+  function sendSarvamAudio(audio) {
+    if (sarvamStt?.readyState !== WebSocket.OPEN) return;
+    sarvamStt.send(JSON.stringify({ audio: { data: mulawToPcm16(audio), sample_rate: "8000", encoding: "audio/wav" } }));
+  }
+
   async function connectOpenAI(parameters = {}) {
     const config = await loadContext(parameters.contextId, parameters.scenario);
     openai = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1", {
@@ -286,18 +410,23 @@ Approved business knowledge: ${config.knowledge}`,
       const requestedProvider = event.start.customParameters?.voiceProvider;
       if (["openai", "sarvam", "cartesia"].includes(requestedProvider)) selectedVoiceProvider = requestedProvider;
       connectCartesia();
-      connectSarvam();
-      connectOpenAI(event.start.customParameters || {}).catch(error => console.error("openai_connect_failed", error.message));
+      if (selectedVoiceProvider === "sarvam") {
+        connectSarvamFullStack(event.start.customParameters || {}).catch(error => console.error("sarvam_connect_failed", error.message));
+      } else {
+        connectOpenAI(event.start.customParameters || {}).catch(error => console.error("openai_connect_failed", error.message));
+      }
     } else if (event.event === "media" && event.media?.payload) {
-      if (ready) sendOpenAI({ type: "input_audio_buffer.append", audio: event.media.payload });
+      if (ready && selectedVoiceProvider === "sarvam") sendSarvamAudio(event.media.payload);
+      else if (ready) sendOpenAI({ type: "input_audio_buffer.append", audio: event.media.payload });
       else bufferedAudio.push(event.media.payload);
     } else if (event.event === "stop") {
       openai?.close(1000, "Twilio stream ended");
       cartesia?.close(1000, "Twilio stream ended");
       sarvam?.close(1000, "Twilio stream ended");
+      sarvamStt?.close(1000, "Twilio stream ended");
     }
   });
-  twilio.on("close", () => { openai?.close(1000, "Caller disconnected"); cartesia?.close(1000, "Caller disconnected"); sarvam?.close(1000, "Caller disconnected"); });
+  twilio.on("close", () => { sarvamReplyController?.abort(); openai?.close(1000, "Caller disconnected"); cartesia?.close(1000, "Caller disconnected"); sarvam?.close(1000, "Caller disconnected"); sarvamStt?.close(1000, "Caller disconnected"); });
   twilio.on("error", error => console.error("twilio_socket_error", error.message));
 });
 

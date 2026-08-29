@@ -18,7 +18,7 @@ const phoneCountries = [
 
 const voiceProviders = [
   { key: "openai", name: "OpenAI", voice: "Coral", detail: "One model listens, thinks and speaks", badge: "LOWEST LATENCY" },
-  { key: "sarvam", name: "Sarvam", voice: "Priya", detail: "Indian English with native cadence", badge: "INDIA NATIVE" },
+  { key: "sarvam", name: "Sarvam", voice: "Priya", detail: "Saaras + 105B + Bulbul voice stack", badge: "FULL SARVAM" },
   { key: "cartesia", name: "Cartesia", voice: "Skylar", detail: "Bright, expressive global delivery", badge: "EXPRESSIVE" },
 ] as const;
 
