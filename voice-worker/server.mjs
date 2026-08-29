@@ -11,7 +11,7 @@ const cartesiaApiKey = process.env.CARTESIA_API_KEY;
 const cartesiaVoiceId = process.env.CARTESIA_VOICE_ID || "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4";
 const sarvamApiKey = process.env.SARVAM_API_KEY;
 const sarvamSpeaker = process.env.SARVAM_SPEAKER || "priya";
-const sarvamLanguage = process.env.SARVAM_LANGUAGE || "en-IN";
+const sarvamLanguage = process.env.SARVAM_LANGUAGE || "hi-IN";
 const sarvamSttModel = process.env.SARVAM_STT_MODEL || "saaras:v3";
 const sarvamChatModel = process.env.SARVAM_CHAT_MODEL || "sarvam-105b-conversations";
 const databaseUrl = process.env.DATABASE_URL;
@@ -284,7 +284,9 @@ twilioServer.on("connection", twilio => {
     sarvamSystemPrompt = `You are ${config.name}, a warm, concise HalaCX receptionist. ${config.instructions} ${scenarios[config.scenario]}
 
 Conversation rules:
-- Match the caller's language, including Hindi-English code-mixing.
+- Begin in natural, everyday Hinglish written in the Roman script.
+- Use an easy Hindi-English mix, not formal Hindi and not corporate English.
+- Match the caller after they respond: continue in Hinglish by default, switch to mostly Hindi or mostly English when that is clearly their preference.
 - Speak naturally and keep most replies to one short sentence.
 - Never repeat or paraphrase what the caller just said.
 - When taking notes, say only a brief acknowledgement and ask the next necessary question.
@@ -293,7 +295,7 @@ Conversation rules:
 
 Approved business knowledge: ${config.knowledge}`;
     connectSarvam();
-    streamTextToSarvam(`Hi, ${config.name} here. How can I help?`, true);
+    streamTextToSarvam(`Hi, main ${config.name} bol rahi hoon. Bataiye, main aapki kaise help kar sakti hoon?`, true);
 
     const query = new URLSearchParams({
       "language-code": "unknown",
